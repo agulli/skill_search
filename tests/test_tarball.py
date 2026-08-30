@@ -187,3 +187,45 @@ async def test_sweep_stops_at_the_target_and_stays_resumable(rig):
     assert indexed >= 8
     assert totals["repos"] < 7          # stopped early rather than draining
     assert store.queue_depth() > 0      # remainder still queued for a resume
+
+
+async def test_name_only_candidates_become_harvestable(rig):
+    """A queue entry with no repos row is invisible to the sweep.
+
+    GH Archive mining and awesome-list scraping yield bare names. Enqueuing
+    one without a repos row silently drops it, because the sweep joins the two
+    — 8,218 mined candidates were lost to exactly this before the stub existed.
+    """
+    store, cfg = rig
+    store.db.execute("DELETE FROM queue")
+    assert store.ensure_repo_stub("someone/found-by-name", "gharchive-mine")
+    store.enqueue("someone/found-by-name", "gharchive-mine", 60)
+    store.commit()
+
+    visible = store.db.execute(
+        "SELECT COUNT(*) c FROM queue q JOIN repos r ON r.full_name = q.full_name "
+        "WHERE r.tree_sha IS NULL"
+    ).fetchone()["c"]
+    assert visible == 1
+
+    # The stub carries no metadata; the tarball path must cope with that.
+    row = store.get_repo("someone/found-by-name")
+    assert row["default_branch"] is None
+    blob = make_tar({"skills/x/SKILL.md": SKILL.format(name="x")})
+    f = fetcher_returning(blob)
+    assert await harvest_repo_tarball(f, store, "someone/found-by-name", cfg, row) == 1
+    await f.aclose()
+
+
+def test_repo_stub_is_idempotent(rig):
+    store, _ = rig
+    assert store.ensure_repo_stub("a/b") is True
+    assert store.ensure_repo_stub("a/b") is False      # already present
+    assert store.ensure_repo_stub("not-a-repo") is False
+
+
+def test_stub_does_not_clobber_real_metadata(rig):
+    """A later stub must never blank out metadata search already fetched."""
+    store, _ = rig
+    store.ensure_repo_stub("acme/skills", "gharchive-mine")
+    assert store.get_repo("acme/skills")["stars"] == 100   # from the fixture

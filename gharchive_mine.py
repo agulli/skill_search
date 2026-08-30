@@ -101,6 +101,9 @@ async def main():
                 for name in names:
                     # Low priority: these are name-matched guesses, so they
                     # queue behind anything search actually confirmed.
+                    # A queue entry with no repos row is invisible to the
+                    # sweep, which joins the two — so create the stub first.
+                    store.ensure_repo_stub(name, "gharchive-mine")
                     store.enqueue(name, "gharchive-mine", 60)
                     added += 1
             store.commit()

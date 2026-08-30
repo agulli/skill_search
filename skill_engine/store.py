@@ -311,6 +311,26 @@ class Store:
             "SELECT 1 FROM repos WHERE full_name = ?", (full_name,)
         ).fetchone()
 
+    def ensure_repo_stub(self, full_name: str, discovered_via: str = "") -> bool:
+        """Create a minimal `repos` row for a candidate we have no metadata for.
+
+        Sources that yield only a name — GH Archive mining, awesome-list links —
+        would otherwise queue a repository the harvester can never see: the
+        sweep joins `queue` to `repos`, so an entry with no row on the other
+        side is silently unharvestable. The stub carries no metadata; the
+        tarball path needs none, falling back to HEAD for the branch, and a
+        later metadata fetch fills the rest in via COALESCE.
+        """
+        if "/" not in full_name:
+            return False
+        owner, _, name = full_name.partition("/")
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO repos(full_name, owner, name, discovered_via, "
+            "first_seen) VALUES(?,?,?,?,?)",
+            (full_name, owner, name, discovered_via, time.time()),
+        )
+        return cur.rowcount > 0
+
     def enqueue_many(self, names: Iterable[tuple[str, str, int]]) -> int:
         added = 0
         for full_name, reason, priority in names:
