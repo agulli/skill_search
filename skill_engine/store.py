@@ -10,11 +10,14 @@ outgrows it.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Iterable
+
+log = logging.getLogger("skill_engine.store")
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -70,9 +73,6 @@ CREATE TABLE IF NOT EXISTS repos (
     last_meta_at    REAL,
     last_error      TEXT
 );
-CREATE INDEX IF NOT EXISTS repos_last_crawled ON repos(last_crawled);
-CREATE INDEX IF NOT EXISTS repos_skill_count ON repos(skill_count);
-CREATE INDEX IF NOT EXISTS repos_stars ON repos(stars DESC);
 
 -- Quantile boundaries per metric, so ranking can normalise heavy-tailed counts
 -- by percentile rather than by a hand-tuned constant.
@@ -110,9 +110,6 @@ CREATE TABLE IF NOT EXISTS skills (
     last_seen       REAL,
     UNIQUE(repo, path)
 );
-CREATE INDEX IF NOT EXISTS skills_hash ON skills(content_hash);
-CREATE INDEX IF NOT EXISTS skills_valid_score ON skills(valid, score DESC);
-CREATE INDEX IF NOT EXISTS skills_repo ON skills(repo);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS skills_fts USING fts5(
     name, description, body, repo, path,
@@ -149,7 +146,6 @@ CREATE TABLE IF NOT EXISTS queue (
     enqueued_at  REAL,
     attempts     INTEGER DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS queue_priority ON queue(priority DESC, enqueued_at);
 
 CREATE TABLE IF NOT EXISTS vectors (
     skill_id  INTEGER PRIMARY KEY REFERENCES skills(id) ON DELETE CASCADE,
@@ -167,14 +163,23 @@ CREATE TABLE IF NOT EXISTS crawl_log (
 """
 
 
-# Indexes on columns that `_migrate` adds must be created after it runs. A
-# database created before `repo_score` existed would otherwise fail to open at
-# all: the schema script would try to index a column the migration had not yet
-# added, and abort before reaching it.
-POST_MIGRATE_INDEXES = """
-CREATE INDEX IF NOT EXISTS repos_score ON repos(repo_score DESC);
-CREATE INDEX IF NOT EXISTS skills_category ON skills(category, subcategory);
-"""
+# Every index lives here rather than in the schema script, and each is applied
+# individually after the migration. Two reasons: an index may reference a column
+# that only `_migrate` adds, and — more importantly — an index is an
+# optimisation, not a correctness requirement. One that cannot be built against
+# an older database should cost some query speed, never the ability to open the
+# file at all.
+INDEXES = (
+    "CREATE INDEX IF NOT EXISTS repos_last_crawled ON repos(last_crawled)",
+    "CREATE INDEX IF NOT EXISTS repos_skill_count ON repos(skill_count)",
+    "CREATE INDEX IF NOT EXISTS repos_stars ON repos(stars DESC)",
+    "CREATE INDEX IF NOT EXISTS repos_score ON repos(repo_score DESC)",
+    "CREATE INDEX IF NOT EXISTS skills_hash ON skills(content_hash)",
+    "CREATE INDEX IF NOT EXISTS skills_valid_score ON skills(valid, score DESC)",
+    "CREATE INDEX IF NOT EXISTS skills_repo ON skills(repo)",
+    "CREATE INDEX IF NOT EXISTS skills_category ON skills(category, subcategory)",
+    "CREATE INDEX IF NOT EXISTS queue_priority ON queue(priority DESC, enqueued_at)",
+)
 
 
 class Store:
@@ -211,7 +216,7 @@ class Store:
         self._tune()
         self.db.executescript(SCHEMA)
         self._migrate()
-        self.db.executescript(POST_MIGRATE_INDEXES)
+        self._build_indexes()
         self.db.commit()
 
     def _tune(self) -> None:
@@ -253,6 +258,16 @@ class Store:
         after = self.db.execute(
             "SELECT COUNT(*) c FROM skills_fts_data").fetchone()["c"]
         return {"segments_before": before, "segments_after": after}
+
+    def _build_indexes(self) -> None:
+        """Apply each index independently, tolerating ones that cannot build."""
+        for statement in INDEXES:
+            try:
+                self.db.execute(statement)
+            except sqlite3.OperationalError as exc:
+                # An older file may lack the column entirely. Losing an index
+                # costs query speed; refusing to open costs everything.
+                log.debug("index skipped (%s): %s", exc, statement)
 
     def _migrate(self) -> None:
         """Add columns introduced after a database was first created.
