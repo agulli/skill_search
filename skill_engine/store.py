@@ -168,8 +168,27 @@ CREATE TABLE IF NOT EXISTS crawl_log (
 
 
 class Store:
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, read_only: bool = False) -> None:
+        """Open the corpus. `read_only` is for serving.
+
+        A public server never writes: the corpus is rebuilt offline and shipped
+        as a file. Opening with `mode=ro` makes that structural rather than
+        conventional — a bug in a request handler cannot corrupt the index, and
+        the volume itself can be mounted read-only. It also skips the schema
+        script and migration check, which a read-only connection could not run
+        anyway.
+        """
         self.path = Path(path)
+        self.read_only = read_only
+
+        if read_only:
+            self.db = sqlite3.connect(
+                f"file:{self.path}?mode=ro", uri=True, timeout=30.0
+            )
+            self.db.row_factory = sqlite3.Row
+            self._tune()
+            return
+
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, timeout=30.0)
         self.db.row_factory = sqlite3.Row

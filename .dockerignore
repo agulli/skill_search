@@ -1,0 +1,15 @@
+# The corpus is shipped to the volume, never baked into the image — a 2.3GB
+# layer would make every deploy slow and every rollback expensive.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+.venv/
+.git/
+.pytest_cache/
+__pycache__/
+*.egg-info/
+tests/
+overnight.py
+whitepaper.md

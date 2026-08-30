@@ -246,6 +246,45 @@ client can build its own interface without a second round trip.
 > The server binds to `127.0.0.1` and has no authentication or rate limiting.
 > It is not ready to face the open internet as-is.
 
+## Deployment
+
+The corpus is built on your machine and shipped as a file; the server only
+reads it. So the container needs no GitHub credentials, no write access, and no
+scheduled jobs — and a deploy is two independent steps.
+
+```bash
+fly launch --no-deploy --name searchskills   # once
+./deploy.sh app                              # code only, fast
+./deploy.sh data                             # upload the corpus
+```
+
+`deploy.sh data` runs `VACUUM INTO` before uploading, which repacks pages freed
+by the crawl: **2.49 GB → 1.47 GB**, and ~0.60 GB gzipped over the wire.
+
+Setting `SKILL_ENGINE_PUBLIC=1` switches on the three things that differ between
+a laptop and the internet: the database opens **read-only**, a per-IP **rate
+limiter** engages, and the proxy's client-IP header is trusted. That header is
+ignored otherwise, since anyone reaching the origin directly can forge it.
+
+`/health` answers outside the limiter, so a health check cannot fail precisely
+when the machine is busiest.
+
+**Memory.** Measured on the deployed corpus, for a broad query matching 43,798
+skills:
+
+| cache | mmap | query | peak RSS |
+|---|---|---|---|
+| 64 MB | 2048 MB | 95 ms | 517 MB |
+| 64 MB | 0 | 128 ms | 86 MB |
+| **192 MB** | **0** | **100 ms** | **189 MB** |
+
+`mmap` maps the database into the address space and RSS counts those pages.
+Giving the same memory to SQLite's page cache instead is the same speed at a
+third of the footprint, so mmap is off and the service fits a 512 MB machine.
+
+Put Cloudflare in front for TLS, caching and DDoS protection. A read-only search
+index caches well, and the origin only sees queries the CDN has not answered.
+
 ## Storage
 
 SQLite with FTS5 — one file, no server. 100k documents rank with BM25 in tens of
@@ -259,7 +298,7 @@ avoids an index that would need rebuilding after every crawl.
 
 ```bash
 pip install -e ".[dev]"
-pytest                      # 106 tests, no network required
+pytest                      # 113 tests, no network required
 ```
 
 Tests cover rate-limit and ETag behaviour against a mock transport, the full

@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
@@ -34,13 +36,67 @@ log = logging.getLogger("skill_engine.serve")
 _local = threading.local()
 
 
-def get_store(db_path) -> Store:
+def get_store(db_path, read_only: bool = False) -> Store:
     """One SQLite connection per handler thread, opened once and kept."""
     store = getattr(_local, "store", None)
     if store is None:
-        store = Store(db_path)
+        store = Store(db_path, read_only=read_only)
         _local.store = store
     return store
+
+
+class RateLimiter:
+    """Token bucket per client, refilled continuously.
+
+    A public search endpoint runs full-text queries over a multi-gigabyte index,
+    so an unthrottled client can consume the whole box with a loop. A CDN in
+    front absorbs most abuse, but it caches by URL — a stream of *distinct*
+    queries passes straight through to the origin, so the application needs its
+    own limit regardless.
+
+    Deliberately in-memory and per-process: no Redis, no coordination. It bounds
+    what a single machine will do, which is the property that matters here.
+    """
+
+    def __init__(self, rate: float = 4.0, burst: int = 40, max_clients: int = 20_000):
+        self.rate = rate            # sustained requests/second
+        self.burst = burst          # bucket depth
+        self.max_clients = max_clients
+        self._buckets: dict[str, tuple[float, float]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, client: str) -> tuple[bool, float]:
+        """Returns (allowed, seconds to wait if not)."""
+        now = time.monotonic()
+        with self._lock:
+            # Cheap bound on memory: a flood of unique IPs cannot grow this
+            # without limit. Dropping the table costs at most one free burst.
+            if len(self._buckets) > self.max_clients:
+                self._buckets.clear()
+
+            tokens, last = self._buckets.get(client, (float(self.burst), now))
+            tokens = min(self.burst, tokens + (now - last) * self.rate)
+            if tokens < 1.0:
+                self._buckets[client] = (tokens, now)
+                return False, (1.0 - tokens) / self.rate
+            self._buckets[client] = (tokens - 1.0, now)
+            return True, 0.0
+
+
+def client_ip(handler, trust_proxy: bool) -> str:
+    """The caller's address, taking proxy headers only when told to.
+
+    `CF-Connecting-IP` and `X-Forwarded-For` are trivially forged by anyone
+    talking to the origin directly, so honouring them unconditionally would let
+    an attacker rotate their apparent identity and bypass the limiter entirely.
+    They are trusted only when the deployment says it really is behind a proxy.
+    """
+    if trust_proxy:
+        for header in ("CF-Connecting-IP", "X-Forwarded-For"):
+            value = handler.headers.get(header)
+            if value:
+                return value.split(",")[0].strip()
+    return handler.client_address[0]
 
 
 PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -354,9 +410,12 @@ document.addEventListener("keydown",e=>{
 </script></body></html>"""
 
 
-def make_handler(db_path, embedder_name: str):
+def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
+                 limiter: RateLimiter | None = None, trust_proxy: bool = False):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
+        server_version = "skill-engine"
+        sys_version = ""          # do not advertise the Python version
 
         def _send(self, code: int, body: bytes, ctype: str) -> None:
             self.send_response(code)
@@ -392,10 +451,26 @@ def make_handler(db_path, embedder_name: str):
             import time as _t
 
             parsed = urlparse(self.path)
+
+            # Liveness must answer even when the limiter is angry, or a health
+            # check failing under load would take the machine out exactly when
+            # it is busiest.
+            if parsed.path == "/health":
+                return self._send(200, b'{"ok":true}', "application/json")
+
+            if limiter is not None:
+                ok, wait = limiter.allow(client_ip(self, trust_proxy))
+                if not ok:
+                    self.send_response(429)
+                    self.send_header("Retry-After", str(max(1, int(wait) + 1)))
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+
             p = parse_qs(parsed.query)
             query = (p.get("q", [""])[0]).strip()
             limit = max(1, min(int(p.get("limit", ["20"])[0] or 20), 200))
-            store = get_store(db_path)
+            store = get_store(db_path, read_only)
 
             if parsed.path == "/":
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
@@ -455,9 +530,30 @@ def make_handler(db_path, embedder_name: str):
 
 
 def serve(db_path, host: str = "127.0.0.1", port: int = 8000,
-          embedder_name: str = "none") -> None:
-    server = ThreadingHTTPServer((host, port), make_handler(db_path, embedder_name))
-    print(f"skill-engine serving on http://{host}:{port}")
+          embedder_name: str = "none", *, read_only: bool | None = None,
+          rate: float | None = None, trust_proxy: bool | None = None) -> None:
+    """Run the UI and API.
+
+    Public deployments should set `SKILL_ENGINE_PUBLIC=1`, which turns on the
+    read-only database, the rate limiter, and trust of the proxy's client-IP
+    header — the three things that differ between a laptop and the internet.
+    """
+    public = os.getenv("SKILL_ENGINE_PUBLIC", "").lower() in ("1", "true", "yes")
+    read_only = public if read_only is None else read_only
+    trust_proxy = public if trust_proxy is None else trust_proxy
+    if rate is None:
+        rate = float(os.getenv("SKILL_ENGINE_RATE", "4")) if public else 0.0
+    limiter = RateLimiter(rate=rate) if rate > 0 else None
+
+    server = ThreadingHTTPServer(
+        (host, port),
+        make_handler(db_path, embedder_name, read_only=read_only,
+                     limiter=limiter, trust_proxy=trust_proxy),
+    )
+    server.daemon_threads = True
+    mode = "read-only" if read_only else "read-write"
+    print(f"skill-engine serving on http://{host}:{port}  ({mode}"
+          f"{f', {rate:g} req/s/client' if limiter else ''})")
     print(f"  UI    http://{host}:{port}/")
     print(f"  API   http://{host}:{port}/api/search?q=pdf&facets=1")
     try:

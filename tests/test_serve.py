@@ -1,6 +1,7 @@
 """The HTTP layer, including the connection reuse that made it usable at scale."""
 
 import json
+import time
 import threading
 from http.server import ThreadingHTTPServer
 
@@ -135,3 +136,73 @@ def test_optimize_compacts_and_reports(tmp_path):
     from skill_engine.search import search
     assert search(st, "skill number testing")
     st.close()
+
+
+# --------------------------------------------------- public deployment mode
+
+
+def test_read_only_store_cannot_write(tmp_path):
+    """Serving opens the corpus read-only so a handler bug cannot corrupt it."""
+    db = tmp_path / "ro.db"
+    Store(db).close()                       # create it read-write first
+    ro = Store(db, read_only=True)
+    assert ro.read_only
+    with pytest.raises(Exception):
+        ro.db.execute("CREATE TABLE nope(x)")
+    # Reads still work, and the tuning pragmas still applied.
+    assert ro.db.execute("SELECT COUNT(*) FROM skills").fetchone()[0] == 0
+    assert ro.db.execute("PRAGMA cache_size").fetchone()[0] < 0
+    ro.close()
+
+
+def test_read_only_open_does_not_create_a_database(tmp_path):
+    with pytest.raises(Exception):
+        Store(tmp_path / "absent.db", read_only=True)
+
+
+def test_rate_limiter_allows_a_burst_then_throttles():
+    from skill_engine.serve import RateLimiter
+
+    rl = RateLimiter(rate=1.0, burst=5)
+    assert all(rl.allow("1.2.3.4")[0] for _ in range(5))    # burst
+    ok, wait = rl.allow("1.2.3.4")
+    assert not ok and wait > 0                              # then blocked
+    assert rl.allow("5.6.7.8")[0]                           # other client fine
+
+
+def test_rate_limiter_refills_over_time():
+    from skill_engine.serve import RateLimiter
+
+    rl = RateLimiter(rate=100.0, burst=1)
+    assert rl.allow("x")[0]
+    assert not rl.allow("x")[0]
+    time.sleep(0.05)                                        # 100/s refills fast
+    assert rl.allow("x")[0]
+
+
+def test_rate_limiter_memory_is_bounded():
+    from skill_engine.serve import RateLimiter
+
+    rl = RateLimiter(rate=1.0, burst=1, max_clients=50)
+    for i in range(500):
+        rl.allow(f"10.0.0.{i}")
+    assert len(rl._buckets) <= 51
+
+
+def test_client_ip_ignores_proxy_headers_unless_trusted():
+    from skill_engine.serve import client_ip
+
+    class FakeHandler:
+        headers = {"CF-Connecting-IP": "9.9.9.9"}
+        client_address = ("10.0.0.1", 1234)
+
+    h = FakeHandler()
+    # Spoofable when talking to the origin directly, so untrusted by default.
+    assert client_ip(h, trust_proxy=False) == "10.0.0.1"
+    assert client_ip(h, trust_proxy=True) == "9.9.9.9"
+
+
+def test_health_endpoint_is_exempt_from_rate_limiting(server):
+    # Health must answer under load, or checks fail exactly when it is busiest.
+    for _ in range(60):
+        assert httpx.get(server + "/health").status_code == 200
