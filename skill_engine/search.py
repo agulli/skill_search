@@ -482,3 +482,90 @@ def get_skill(store: Store, skill_id: int) -> dict | None:
         f"https://raw.githubusercontent.com/{data['repo']}/{branch}/{data['path']}"
     )
     return data
+
+
+# ------------------------------------------------------------------ browsing
+
+
+def category_counts(store: Store, filters: dict | None = None) -> dict[str, dict]:
+    """How many skills sit in each category and subcategory.
+
+    Browsing needs counts up front — a directory entry with no size is a link
+    into the dark. One grouped pass over an indexed column answers the whole
+    tree, so the landing page costs a single query.
+    """
+    where, params = _where({**(filters or {}), "valid_only": True})
+    try:
+        rows = store.db.execute(
+            f"""SELECT s.category AS c, s.subcategory AS sub, COUNT(*) AS n
+                FROM skills s JOIN repos r ON r.full_name = s.repo
+                WHERE {where} AND s.category IS NOT NULL
+                GROUP BY c, sub""",
+            params,
+        ).fetchall()
+    except Exception:
+        return {}
+
+    out: dict[str, dict] = {}
+    for row in rows:
+        entry = out.setdefault(row["c"], {"total": 0, "subs": {}})
+        entry["total"] += row["n"]
+        if row["sub"]:
+            entry["subs"][row["sub"]] = entry["subs"].get(row["sub"], 0) + row["n"]
+    return out
+
+
+def browse(store: Store, category: str, subcategory: str | None = None, *,
+           limit: int = 30, offset: int = 0, sort: str = "quality",
+           filters: dict | None = None) -> tuple[list[Hit], int]:
+    """List a category's skills, best first. Returns (page, total).
+
+    Browsing is not searching: there is no query to be relevant to, so ordering
+    falls back to the quality prior the ranker already computed. Duplicates are
+    collapsed and the per-repository cap applies here too — without them a
+    category page is just one prolific repository fifteen times over.
+    """
+    where, params = _where({**(filters or {}), "valid_only": True})
+    clause = "s.category = ?"
+    args: list[Any] = [category]
+    if subcategory:
+        clause += " AND s.subcategory = ?"
+        args.append(subcategory)
+
+    order = {
+        "quality": "s.score DESC",
+        "stars": "r.stars DESC, s.score DESC",
+        "recent": "r.pushed_at DESC, s.score DESC",
+        "name": "s.name ASC",
+    }.get(sort, "s.score DESC")
+
+    total = store.db.execute(
+        f"SELECT COUNT(*) c FROM skills s JOIN repos r ON r.full_name = s.repo "
+        f"WHERE {clause} AND {where}", [*args, *params]
+    ).fetchone()["c"]
+
+    # Over-fetch so collapsing duplicates and capping per repo still fills a page.
+    rows = store.db.execute(
+        f"""SELECT s.id, s.repo, s.path, s.name, s.description, s.source_kind,
+                   s.license, s.score, s.resources, s.content_hash, r.stars
+            FROM skills s JOIN repos r ON r.full_name = s.repo
+            WHERE {clause} AND {where}
+            ORDER BY {order} LIMIT ? OFFSET ?""",
+        [*args, *params, (limit + offset) * 4, 0],
+    ).fetchall()
+
+    hits = [
+        Hit(skill_id=r["id"], repo=r["repo"], path=r["path"], name=r["name"],
+            description=r["description"], source_kind=r["source_kind"],
+            license=r["license"], score=r["score"], stars=r["stars"] or 0,
+            content_hash=r["content_hash"] or "",
+            snippet=(r["description"] or "")[:240],
+            resources=json.loads(r["resources"] or "[]"),
+            rank=r["score"], matched_by="browse")
+        for r in rows
+    ]
+    deduped = list(collapse_duplicates({h.skill_id: h for h in hits}).values())
+    deduped.sort(key=lambda h: -h.rank)
+    page = diversify(deduped, 3)[offset:offset + limit]
+    attach_author_scores(store, page)
+    return page, total

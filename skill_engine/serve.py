@@ -28,7 +28,9 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from .search import count_matches, facet_counts, get_skill, search
+from .search import (browse, category_counts, count_matches, facet_counts,
+                     get_skill, search)
+from .taxonomy import category_tree
 from .store import Store
 
 log = logging.getLogger("skill_engine.serve")
@@ -176,6 +178,33 @@ select,input[type=number]{width:100%;padding:6px 8px;border:1px solid var(--line
   border-radius:8px;background:var(--panel);color:var(--fg);cursor:pointer;font-size:13px}
 .more:hover{border-color:var(--ring)}
 .empty,.hint{color:var(--muted);padding:44px 0;text-align:center}
+/* Directory: the landing view when nothing has been typed. */
+.dirhead{margin:2px 0 18px}
+.dirhead h1{font-size:21px;letter-spacing:-.015em;margin:0 0 4px}
+.dirhead p{color:var(--muted);font-size:14px;margin:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(228px,1fr));gap:12px}
+.cat{border:1px solid var(--line);border-radius:11px;padding:14px 15px;cursor:pointer;
+  background:var(--panel);transition:border-color .12s,transform .12s}
+.cat:hover{border-color:var(--ring);transform:translateY(-1px)}
+.cat .top{display:flex;align-items:baseline;gap:8px;margin-bottom:3px}
+.cat .ico{font-size:17px;line-height:1}
+.cat h3{font-size:14.5px;margin:0;font-weight:640;flex:1}
+.cat .n{font-size:12px;color:var(--accent);font-variant-numeric:tabular-nums}
+.cat p{margin:0 0 9px;font-size:12.5px;color:var(--muted);line-height:1.45}
+.subs{display:flex;flex-wrap:wrap;gap:4px}
+.sub{font-size:11.5px;color:var(--muted);border:1px solid var(--line);
+  border-radius:999px;padding:1px 7px}
+.sub:hover{border-color:var(--ring);color:var(--accent)}
+.crumb{display:flex;align-items:center;gap:8px;margin:0 0 14px;font-size:13px;flex-wrap:wrap}
+.crumb a{color:var(--accent);cursor:pointer;text-decoration:none}
+.crumb .sep{color:var(--faint)}
+.crumb h2{font-size:17px;margin:0;font-weight:640}
+.subnav{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 16px}
+.subnav .sub{cursor:pointer;padding:3px 10px;font-size:12.5px}
+.subnav .sub.on{background:var(--accent-soft);color:var(--accent);border-color:var(--ring)}
+.sortbar{display:flex;gap:10px;font-size:12.5px;color:var(--muted);margin:0 0 10px}
+.sortbar span{cursor:pointer}
+.sortbar span.on{color:var(--accent);font-weight:600}
 .hint b{color:var(--fg)}
 .ex{display:inline-block;margin:4px;padding:3px 10px;border:1px solid var(--line);
   border-radius:999px;font-size:12.5px;cursor:pointer;color:var(--muted)}
@@ -230,7 +259,8 @@ const EX=["extract tables from a pdf invoice","write terraform modules for aws",
   "review a react component for accessibility","summarise a research paper",
   "build a slide deck","analyse a spreadsheet and chart it"];
 let state={q:"",limit:20,kind:"",license:"",language:"",min_stars:0,min_score:0,
-           max_age_days:0,forks:0};
+           max_age_days:0,forks:0,cat:"",sub:"",sort:"quality",offset:0};
+let CATS=null;
 let inflight=null;
 
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -246,14 +276,76 @@ function qs(extra={}){
 }
 
 function syncURL(){
-  const u=new URL(location); u.search=state.q?qs():""; history.replaceState({},"",u);
+  const u=new URL(location);
+  if(state.q) u.search=qs();
+  else if(state.cat){ const p=new URLSearchParams({c:state.cat});
+    if(state.sub) p.set("sub",state.sub); u.search=p.toString(); }
+  else u.search="";
+  history.replaceState({},"",u);
+}
+
+async function renderDirectory(){
+  $("#facets").innerHTML=""; $("#meta").innerHTML="";
+  if(!CATS){ CATS=await (await fetch("/api/categories")).json(); }
+  const cards=CATS.categories.map(c=>`
+    <div class="cat" data-cat="${esc(c.id)}">
+      <div class="top"><span class="ico">${c.icon}</span>
+        <h3>${esc(c.label)}</h3><span class="n">${num(c.count)}</span></div>
+      <p>${esc(c.blurb)}</p>
+      <div class="subs">${c.subs.slice(0,4).map(s=>
+        `<span class="sub">${esc(s.label)} ${num(s.count)}</span>`).join("")}</div>
+    </div>`).join("");
+  $("#results").innerHTML=
+    `<div class="dirhead"><h1>Browse the directory</h1>
+       <p>${CATS.total.toLocaleString()} skills, sorted into ${CATS.categories.length} subjects.
+          Or search above if you already know what you want.</p></div>
+     <div class="grid">${cards}</div>`;
+}
+
+async function renderCategory(){
+  const cat=CATS.categories.find(c=>c.id===state.cat);
+  if(!cat) return renderDirectory();
+  const p=new URLSearchParams({c:state.cat,limit:state.limit,offset:state.offset,sort:state.sort});
+  if(state.sub) p.set("sub",state.sub);
+  $("#meta").innerHTML='<span class="spin"></span>';
+  const d=await (await fetch("/api/browse?"+p)).json();
+
+  const subnav=cat.subs.map(s=>
+    `<span class="sub ${state.sub===s.id?"on":""}" data-sub="${esc(s.id)}">${esc(s.label)} ${num(s.count)}</span>`).join("");
+  const sorts=["quality","stars","recent","name"].map(k=>
+    `<span class="${state.sort===k?"on":""}" data-sort="${k}">${k}</span>`).join("");
+
+  $("#facets").innerHTML="";
+  $("#meta").innerHTML=`<span><b>${d.total.toLocaleString()}</b> skills</span><span>${d.took_ms} ms</span>`;
+  $("#results").innerHTML=
+    `<div class="crumb"><a data-home="1">Directory</a><span class="sep">›</span>
+       <h2>${cat.icon} ${esc(cat.label)}</h2></div>
+     <div class="subnav"><span class="sub ${state.sub?"":"on"}" data-sub="">All ${num(cat.count)}</span>${subnav}</div>
+     <div class="sortbar"><span style="cursor:default">sort:</span>${sorts}</div>
+     ${d.results.map(hitCard).join("")}
+     ${d.results.length>=state.limit?'<button class="more" id="more">Show more</button>':""}`;
+}
+
+function hitCard(r){
+  const tags=[`<span class="tag q">q${Math.round(r.quality)}</span>`,
+    r.author_score!=null?`<span class="tag a">author ${Math.round(r.author_score)}</span>`:"",
+    `<span class="tag">${num(r.stars)}★</span>`,
+    r.license?`<span class="tag">${esc(r.license)}</span>`:"",
+    r.duplicates?`<span class="tag">${r.duplicates} copies</span>`:""].join("");
+  return `<article class="hit" data-id="${r.id}">
+    <p class="title">${esc(r.name)}</p>
+    <p class="repo">${esc(r.repo)} · ${esc(r.path)}</p>
+    <p class="desc">${esc((r.description||"").slice(0,240))}</p>
+    <div class="tags">${tags}</div></article>`;
 }
 
 async function run(){
   if(!state.q.trim()){
-    $("#results").innerHTML='<div class="hint"><b>Search 100,000 agent skills.</b><br>'+
-      'Try: '+EX.map(e=>`<span class="ex" data-ex="${esc(e)}">${esc(e)}</span>`).join("")+'</div>';
-    $("#meta").innerHTML=""; $("#facets").innerHTML=""; syncURL(); return;
+    if(state.cat) return renderCategory();
+    return renderDirectory();
+  }
+  if(false){
+    return;
   }
   $("#meta").innerHTML='<span class="spin"></span>';
   if(inflight) inflight.abort();
@@ -371,7 +463,7 @@ function closeDrawer(){$("#scrim").classList.remove("open");$("#drawer").classLi
 
 let t=null;
 $("#q").addEventListener("input",e=>{
-  state.q=e.target.value; state.limit=20;
+  state.q=e.target.value; state.limit=20; state.cat=""; state.sub="";
   // Server responds in 60-175ms, so a long debounce is now the
   // dominant delay rather than a protection against load.
   clearTimeout(t); t=setTimeout(run,110);
@@ -385,6 +477,13 @@ document.addEventListener("click",e=>{
   if(e.target.id==="more"){state.limit+=30; run(); return;}
   if(e.target.id==="clr"){["kind","license","language","min_stars","min_score","max_age_days"]
       .forEach(k=>state[k]=k.startsWith("min")||k.startsWith("max")?0:""); state.limit=20; run(); return;}
+  const cat=e.target.closest("[data-cat]");
+  if(cat){state.cat=cat.dataset.cat; state.sub=""; state.offset=0; state.limit=20; run(); return;}
+  const sub=e.target.closest("[data-sub]");
+  if(sub){state.sub=sub.dataset.sub; state.offset=0; state.limit=20; run(); return;}
+  const so=e.target.closest("[data-sort]");
+  if(so){state.sort=so.dataset.sort; state.limit=20; run(); return;}
+  if(e.target.closest("[data-home]")){state.cat=""; state.sub=""; run(); return;}
   const hit=e.target.closest(".hit"); if(hit){openSkill(hit.dataset.id); return;}
   if(e.target.id==="scrim"||e.target.id==="closeBtn") closeDrawer();
 });
@@ -400,6 +499,8 @@ document.addEventListener("keydown",e=>{
 (async()=>{
   const s=await (await fetch("/api/stats")).json();
   $("#corpus").textContent=`· ${s.valid_skills.toLocaleString()} skills from ${s.repos_with_skills.toLocaleString()} repos`;
+  const cp=new URLSearchParams(location.search);
+  if(cp.get("c")){ state.cat=cp.get("c"); state.sub=cp.get("sub")||""; }
   const p=new URLSearchParams(location.search);
   if(p.get("q")){ state.q=p.get("q"); $("#q").value=state.q;
     for(const k of ["kind","license","language","min_stars","min_score","max_age_days"])
@@ -520,6 +621,41 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                 data = get_author(store, login)
                 return self._json(200 if data else 404,
                                   data or {"error": "not found"})
+
+            if parsed.path == "/api/categories":
+                counts = category_counts(store)
+                tree = []
+                for cat in category_tree():
+                    entry = counts.get(cat["id"], {"total": 0, "subs": {}})
+                    if not entry["total"]:
+                        continue
+                    cat["count"] = entry["total"]
+                    for sub in cat["subs"]:
+                        sub["count"] = entry["subs"].get(sub["id"], 0)
+                    cat["subs"] = [s for s in cat["subs"] if s["count"]]
+                    cat["subs"].sort(key=lambda s: -s["count"])
+                    tree.append(cat)
+                tree.sort(key=lambda c: -c["count"])
+                return self._json(200, {"categories": tree,
+                                        "total": sum(c["count"] for c in tree)})
+
+            if parsed.path == "/api/browse":
+                category = p.get("c", [""])[0]
+                if not category:
+                    return self._json(400, {"error": "missing ?c="})
+                sub = p.get("sub", [None])[0] or None
+                offset = max(0, int(p.get("offset", ["0"])[0] or 0))
+                sort = p.get("sort", ["quality"])[0]
+                t0 = _t.perf_counter()
+                hits, total = browse(store, category, sub, limit=limit,
+                                     offset=offset, sort=sort,
+                                     filters=self._filters(p))
+                return self._json(200, {
+                    "category": category, "subcategory": sub,
+                    "count": len(hits), "total": total, "offset": offset,
+                    "took_ms": round((_t.perf_counter() - t0) * 1000),
+                    "results": [h.to_dict() for h in hits],
+                })
 
             if parsed.path == "/api/stats":
                 return self._json(200, store.stats())

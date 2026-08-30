@@ -67,6 +67,42 @@ KEYWORD_QUERIES = [
     "awesome agent skills in:name",
 ]
 
+# The high-volume veins, ordered by measured precision. Each reports far more
+# than the 1,000 results search will hand over, so they are only reachable via
+# the date-bisection in `search_repos` — that is what turns a 324,634-result
+# query from a 1,000-repo ceiling into an enumerable population.
+#
+#   "SKILL.md" in:readme    324,634    highest-precision large vein
+#   topic:claude-code        65,766
+#   "agent skills"           43,527
+#   topic:agent-skills       18,580
+#   ".claude/skills"         17,215
+#   "claude skills"          17,204
+#   "allowed-tools"          15,150    frontmatter key, so very precise
+#
+# Broader still (`skill in:name` reports 1.1M) but precision collapses; those
+# are left out because a tree lookup per repo is the cost of a wrong guess.
+SCALE_QUERIES = [
+    '"SKILL.md" in:readme',
+    '"allowed-tools" in:readme',
+    '".claude/skills"',
+    '"agent skills"',
+    '"claude skills"',
+    "topic:claude-code",
+    "topic:agent-skills",
+    "topic:claude-skills",
+    "topic:agent-skill",
+    "topic:claude-skill",
+    "topic:claude-code-skills",
+    '"skills/" in:readme claude',
+    '"SKILL.md" in:file',
+    '"name:" "description:" in:readme skill',
+    "topic:anthropic",
+    "topic:agentic-ai",
+    "topic:openclaw",
+    "topic:subagents",
+]
+
 # Broader sweeps: lower precision, but they reach authors who tag nothing and
 # name nothing helpfully. The tree lookup is what actually confirms a hit.
 BREADTH_QUERIES = [
@@ -226,7 +262,8 @@ async def mass_discover(
     populated.
     """
     queries = queries or (
-        [f"topic:{t}" for t in SEED_TOPICS] + KEYWORD_QUERIES + BREADTH_QUERIES
+        SCALE_QUERIES + [f"topic:{t}" for t in SEED_TOPICS]
+        + KEYWORD_QUERIES + BREADTH_QUERIES
     )
     for i, q in enumerate(queries):
         have = store.db.execute("SELECT COUNT(*) c FROM repos").fetchone()["c"]

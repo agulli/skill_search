@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -22,7 +23,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from skill_engine.config import Config
-from skill_engine.discover import BREADTH_QUERIES, KEYWORD_QUERIES, search_repos
+from skill_engine.discover import (BREADTH_QUERIES, KEYWORD_QUERIES,
+                                   SCALE_QUERIES, search_repos)
 from skill_engine.github import GitHubClient
 from skill_engine.ranking import recompute
 from skill_engine.store import Store
@@ -30,8 +32,8 @@ from skill_engine.tarball import run_tarball_crawl
 
 TARGET = int(sys.argv[1]) if len(sys.argv) > 1 else 100_000
 DB = sys.argv[2] if len(sys.argv) > 2 else "data/big.db"
-MAX_MB = 25
-CONCURRENCY = 4
+MAX_MB = int(os.getenv("SKILL_ENGINE_MAX_MB", "10"))
+CONCURRENCY = int(os.getenv("SKILL_ENGINE_SWEEP_CONCURRENCY", "5"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,7 +90,7 @@ async def phase_discover(store, cfg, rounds: int) -> int:
     gh = GitHubClient(cfg.tokens, etag_store=store)
     added = 0
     try:
-        queries = KEYWORD_QUERIES + BREADTH_QUERIES
+        queries = SCALE_QUERIES + KEYWORD_QUERIES + BREADTH_QUERIES
         for q in queries[: rounds]:
             try:
                 _, new = await search_repos(gh, store, q, reason="overnight",
@@ -125,10 +127,10 @@ async def main() -> None:
             break
 
         _, queued = counts(store)
-        if queued < 500:
+        if queued < 3000:
             log.info("queue low (%d); widening via search", queued)
             try:
-                await phase_discover(store, cfg, rounds=12)
+                await phase_discover(store, cfg, rounds=len(SCALE_QUERIES))
                 recompute(store)          # rank the newcomers before sweeping
             except Exception as exc:
                 log.exception("discovery phase failed, continuing: %s", exc)

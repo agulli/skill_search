@@ -249,6 +249,9 @@ class Store:
                 "warnings": "TEXT",
                 "score_detail": "TEXT",
                 "dup_count": "INTEGER DEFAULT 0",
+                "category": "TEXT",
+                "subcategory": "TEXT",
+                "categories": "TEXT",
             },
             "repos": {
                 "discovered_via": "TEXT", "owner_type": "TEXT", "homepage": "TEXT",

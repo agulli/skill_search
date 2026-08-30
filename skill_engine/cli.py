@@ -442,6 +442,20 @@ async def cmd_enrich(args, cfg) -> None:
         store.close()
 
 
+def cmd_categorize(args, cfg) -> None:
+    """Sort every skill into the browsable subject taxonomy."""
+    from .taxonomy import categorise_corpus
+
+    store = Store(cfg.db_path)
+    result = categorise_corpus(store)
+    total = sum(result["counts"].values()) or 1
+    print(f"classified {result['classified']:,} skills\n")
+    for cid, n in sorted(result["counts"].items(), key=lambda x: -x[1]):
+        bar = "#" * int(46 * n / total)
+        print(f"  {n:>7,} ({100*n/total:>4.1f}%)  {cid:<15} {bar}")
+    store.close()
+
+
 def cmd_stats(args, cfg) -> None:
     store = Store(cfg.db_path)
     stats = store.stats()
@@ -597,6 +611,9 @@ def build_parser() -> argparse.ArgumentParser:
     md = sub.add_parser("mass-discover", help="sweep search until N repos are known")
     md.add_argument("--target", type=int, default=10_000)
     md.set_defaults(func=cmd_mass_discover, is_async=True)
+
+    cz = sub.add_parser("categorize", help="sort skills into browsable categories")
+    cz.set_defaults(func=cmd_categorize, is_async=False)
 
     st = sub.add_parser("stats", help="index statistics")
     st.set_defaults(func=cmd_stats, is_async=False)
