@@ -557,6 +557,70 @@ interface without a second round trip.
 
 ---
 
+## 6b. The catalogue
+
+Search requires knowing what you want. For a corpus nobody has surveyed, the
+more common need is the opposite — *show me what exists* — so the landing view
+is a browsable directory of 16 subjects, each with three to five
+subcategories, counts, and skills ordered by the quality prior.
+
+**Rules, not a model.** Classifying 100,000 skills with an LLM would cost real
+money, take hours, and need re-running after every crawl. Categories are instead
+matched by weighted patterns over a skill's name, description, path and its
+repository's topics: deterministic, a few minutes over the whole corpus, free,
+and explainable — a directory that cannot say *why* something is filed
+somewhere cannot be corrected.
+
+The taxonomy was derived rather than invented: term frequencies across 95,725
+skill names and descriptions surfaced the real clusters (review, design, api,
+analysis, audit, content, product, planning, security, mcp, research,
+architecture, testing), and the subjects follow them.
+
+### Three corrections, each found by looking at the output
+
+**Breadth beat relevance.** Counting raw pattern matches put **69.7% of the
+corpus into one category**. No single term was responsible — the most common,
+"agent", appears in under 10% of skills. The cause was structural: a category
+with twenty patterns simply accumulates more than one with eleven. Weighting
+each pattern by its inverse document frequency against the corpus makes
+categories compete on the *specificity* of what they matched rather than on how
+many patterns their author happened to write.
+
+**Corpus-universal terms identify nothing.** Even IDF-weighted, "AI & Agents"
+still took 54%. The words "agent", "claude", "prompt" and "eval" describe what
+this entire corpus *is*; inside it they are stopwords, not subjects — an "AI"
+category in a directory of AI skills is a "Websites" category in the Yahoo
+directory. Narrowed to genuinely distinct topics (MCP servers, RAG, fine-tuning,
+guardrails), the distribution flattened.
+
+**A missing word boundary.** The pattern `auth` compiled to `\bauth` with no
+trailing anchor and matched "Cypher **auth**oring", filing a Neo4j Spark
+connector under Security. Short patterns now match whole words; stems of six
+characters or more keep prefix matching, so "refactor" still catches
+"refactoring". Separately, a description listing seven features let a passing
+mention of JWT outvote the subject, so each field's contribution is capped.
+
+The result is a directory rather than a pile:
+
+| Subject | Share | | Subject | Share |
+|---|---|---|---|---|
+| Business & Marketing | 15.7% | | Product & Planning | 4.6% |
+| Productivity & Workflow | 12.6% | | Writing & Content | 4.5% |
+| AI & Agents | 8.0% | | Testing & Quality | 3.9% |
+| Security | 7.4% | | Data & Analytics | 2.8% |
+| *Uncategorised* | *6.8%* | | Mobile & Desktop | 2.8% |
+| Web & Frontend | 6.2% | | Documents & Files | 2.0% |
+| Research & Science | 6.0% | | Games & Simulation | 0.9% |
+| Design & Creative | 5.9% | | | |
+| DevOps & Infrastructure | 5.1% | | | |
+| Software Engineering | 4.9% | | | |
+
+Uncategorised is shown rather than hidden. A directory that silently drops what
+it cannot place is lying about its own coverage.
+
+Browsing reuses the search pipeline's duplicate collapsing and per-repository
+cap. Without them a category page is one prolific repository fifteen times over.
+
 ## 7. Failure modes found and fixed
 
 These are documented because each was invisible until measured, and each changed
