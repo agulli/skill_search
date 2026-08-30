@@ -134,6 +134,36 @@ skill-engine explain 42                      # a skill
 skill-engine explain anthropics/skills       # a repository
 ```
 
+### Browse
+
+Search answers "I know what I want". A directory answers "show me what exists",
+which for a corpus nobody has seen is often the better question — so the landing
+view is a browsable catalogue of 16 subjects with subcategories and counts, and
+typing switches to search.
+
+Skills are sorted by weighted pattern matching over name, description, path and
+repository topics. Rules rather than a model: deterministic, seconds over 100k
+skills, free to re-run when the taxonomy changes, and explainable. The subjects
+themselves were derived from term frequencies across the corpus rather than
+invented.
+
+Two details make the difference between a directory and a pile:
+
+**Patterns are IDF-weighted.** Counting raw matches put 69.7% of the corpus in
+one category — not because any single term dominated, but because a category
+with twenty patterns accumulates more than one with eleven. Weighting each
+pattern by how rare it is in the corpus makes specificity beat breadth.
+
+**Corpus-universal terms identify nothing.** "agent", "claude" and "prompt"
+describe what this whole corpus *is*, so an "AI & Agents" category built on them
+swallowed 54% of it. Narrowed to genuine subjects — MCP, RAG, fine-tuning — the
+distribution flattens to business 15.7%, productivity 12.6%, AI 8.0%, security
+7.4%, with 6.8% honestly marked uncategorised.
+
+```bash
+skill-engine categorize      # sort the corpus, offline, re-runnable
+```
+
 ### Search
 
 Three retrievers fused with weighted Reciprocal Rank Fusion: BM25 over FTS5
@@ -173,6 +203,7 @@ skill-engine run           [--limit N]             # discover + crawl, for cron
 skill-engine rank          [--weight name=v] [--top N] [--no-optimize]
 skill-engine explain       ID | owner/repo
 skill-engine authors       [--min-skills 3]
+skill-engine categorize                            # sort skills into the directory
 skill-engine index         [--embedder local|voyage|hashing]
 skill-engine search        QUERY [--min-stars N] [--min-score N] [--license MIT]
                                  [--kind ...] [--language ...] [--owner-type ...]
@@ -235,6 +266,8 @@ GET /                       the search UI
 GET /api/search?q=...&limit=20&facets=1
                             &kind= &license= &language= &min_stars=
                             &min_score= &max_age_days= &forks=1
+GET /api/categories         the directory tree with counts
+GET /api/browse?c=...&sub=...&sort=quality|stars|recent|name
 GET /api/skill/{id}         body, resources, score families
 GET /api/author/{login}     reputation and its breakdown
 GET /api/stats
@@ -298,7 +331,7 @@ avoids an index that would need rebuilding after every crawl.
 
 ```bash
 pip install -e ".[dev]"
-pytest                      # 113 tests, no network required
+pytest                      # 124 tests, no network required
 ```
 
 Tests cover rate-limit and ETag behaviour against a mock transport, the full
