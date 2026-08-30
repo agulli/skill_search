@@ -1,0 +1,118 @@
+# Seed repositories for skill-engine discovery.
+#
+# 100 entries, all confirmed to exist on GitHub via the repository search API.
+# Tier 1 was additionally verified by fetching each repo's git tree and counting
+# real SKILL.md files; the counts below are measured, not estimated.
+#
+# Entries whose name contains "awesome" are ALSO mined for outbound GitHub links
+# (discover.mine_awesome_lists). That is why tier 2 belongs here despite holding
+# zero skills of its own: two of these READMEs alone yielded 3,560 candidate
+# repositories at zero API cost, the best request-to-discovery ratio available.
+#
+# Unreachable entries are harmless: a 404 dequeues the repo permanently.
+
+# ── tier 1: verified to contain SKILL.md (44 repos, 14,430 files measured) ──
+sickn33/agentic-awesome-skills                       # 6,606 SKILL.md  (exceeds max_skills_per_repo; will be capped)
+mohitagw15856/pm-claude-skills                       # 3,550 SKILL.md  (exceeds max_skills_per_repo; will be capped)
+affaan-m/ECC                                         # 898 SKILL.md  (exceeds max_skills_per_repo; will be capped)
+ComposioHQ/awesome-claude-skills                     # 864 SKILL.md  (exceeds max_skills_per_repo; will be capped)
+alirezarezvani/claude-skills                         # 846 SKILL.md  (exceeds max_skills_per_repo; will be capped)
+rampstackco/claude-skills                            # 206 SKILL.md
+wondelai/skills                                      # 193 SKILL.md
+wshobson/agents                                      # 181 SKILL.md
+K-Dense-AI/scientific-agent-skills                   # 163 SKILL.md
+Orchestra-Research/AI-Research-SKILLs                # 98 SKILL.md
+internet-court/internet-court-skill                  # 95 SKILL.md
+tech-leads-club/agent-skills                         # 88 SKILL.md
+SamurAIGPT/Generative-Media-Skills                   # 73 SKILL.md
+phuryn/pm-skills                                     # 68 SKILL.md
+Jeffallan/claude-skills                              # 67 SKILL.md
+jezweb/claude-skills                                 # 63 SKILL.md
+samber/cc-skills-golang                              # 46 SKILL.md
+Prat011/awesome-llm-skills                           # 31 SKILL.md
+addyosmani/agent-skills                              # 25 SKILL.md
+NVIDIA/SkillSpector                                  # 25 SKILL.md
+sergebulaev/linkedin-skills                          # 24 SKILL.md
+JuliusBrussee/caveman                                # 24 SKILL.md
+thedotmack/claude-mem                                # 24 SKILL.md
+JimLiu/baoyu-skills                                  # 22 SKILL.md
+anthropics/skills                                    # 20 SKILL.md
+laolaoshiren/claude-code-skills-zh                   # 20 SKILL.md
+OthmanAdi/planning-with-files                        # 18 SKILL.md
+mhattingpete/claude-skills-marketplace               # 18 SKILL.md
+obra/superpowers                                     # 14 SKILL.md
+Leonxlnx/taste-skill                                 # 13 SKILL.md
+ljagiello/ctf-skills                                 # 11 SKILL.md
+shanraisshan/claude-code-best-practice               # 9 SKILL.md
+KKKKhazix/khazix-skills                              # 6 SKILL.md
+addyosmani/web-quality-skills                        # 6 SKILL.md
+oxylabs/agent-skills                                 # 5 SKILL.md
+zarazhangrui/frontend-slides                         # 2 SKILL.md
+op7418/guizang-ppt-skill                             # 1 SKILL.md
+titanwings/distilly                                  # 1 SKILL.md
+wesammustafa/Claude-Code-Everything-You-Need-to-Know # 1 SKILL.md
+blader/humanizer                                     # 1 SKILL.md
+mvanhorn/last30days-skill                            # 1 SKILL.md
+tt-a1i/archify                                       # 1 SKILL.md
+op7418/guizang-social-card-skill                     # 1 SKILL.md
+Vincentwei1021/video-shotcraft                       # 1 SKILL.md
+
+# ── tier 2: curated hubs, mined for links (14 repos) ──
+VoltAgent/awesome-agent-skills                       # link hub, 33,206★
+karanb192/awesome-claude-skills                      # link hub, 502★
+travisvn/awesome-claude-skills                       # link hub, 14,877★
+hesreallyhim/awesome-claude-code                     # link hub, 53,172★
+heilcheng/awesome-agent-skills                       # link hub, 6,154★
+VoltAgent/awesome-openclaw-skills                    # link hub, 52,235★
+agentskills/agentskills                              # link hub, 24,852★
+helloianneo/awesome-claude-code-skills               # link hub, 453★
+Mann1988/awesome-claude-skills                       # link hub, 64★
+BehiSecc/awesome-claude-skills                       # link hub, 10,067★
+ikaijua/Awesome-AITools                              # link hub, 6,161★
+seb1n/awesome-ai-agent-skills                        # link hub, 166★
+bergside/awesome-design-skills                       # link hub, 2,577★
+gamedev-skills/awesome-gamedev-agent-skills          # link hub, 737★
+
+# ── tier 3: ranked candidates, SKILL.md not yet verified (42 repos) ──
+Agents365-ai/drawio-skill                            # 8,323★, pushed 2026-08-28
+jangviktor-web/nihaixia                              # 2,717★, pushed 2026-08-19
+jeremylongshore/tons-of-skills-marketplace           # 2,686★, pushed 2026-08-29
+JCodesMore/ai-website-cloner-template                # 33,345★, pushed 2026-08-14
+levnikolaevich/claude-code-skills                    # 554★, pushed 2026-08-29
+chuspeeism/dashi-ppt-skill                           # 6,817★, pushed 2026-07-30
+CherryHQ/cherry-studio                               # 51,231★, pushed 2026-08-29
+vercel-labs/agent-skills                             # 30,609★, pushed 2026-08-28
+iOfficeAI/OfficeCLI                                  # 29,492★, pushed 2026-08-25
+cathrynlavery/diagram-design                         # 28,538★, pushed 2026-08-29
+kepano/obsidian-skills                               # 47,494★, pushed 2026-06-08
+bitwize-music-studio/claude-ai-music-skills          # 462★, pushed 2026-08-26
+Imbad0202/academic-research-skills                   # 44,164★, pushed 2026-08-27
+browser-act/skills                                   # 5,520★, pushed 2026-08-24
+DietrichGebert/ponytail                              # 116,193★, pushed 2026-08-07
+Graphify-Labs/graphify                               # 112,212★, pushed 2026-08-28
+yanliudesign/offer-toolkit-skill                     # 340★, pushed 2026-08-22
+teng-lin/notebooklm-py                               # 18,996★, pushed 2026-08-29
+mukul975/Anthropic-Cybersecurity-Skills              # 31,592★, pushed 2026-08-24
+muratcankoylan/Agent-Skills-for-Context-Engineering  # 17,864★, pushed 2026-08-19
+Egonex-AI/Understand-Anything                        # 80,969★, pushed 2026-08-26
+virgiliojr94/book-to-skill                           # 26,958★, pushed 2026-08-28
+nextlevelbuilder/ui-ux-pro-max-skill                 # 122,846★, pushed 2026-08-27
+isjiamu/gzh-design-skill                             # 3,384★, pushed 2026-07-08
+MicrosoftDocs/Agent-Skills                           # 724★, pushed 2026-08-17
+staruhub/ClaudeSkills                                # 706★, pushed 2026-08-13
+santifer/career-ops                                  # 69,207★, pushed 2026-08-28
+code-yeongyu/oh-my-openagent                         # 68,503★, pushed 2026-08-29
+JasonColapietro/suede-creator-skills                 # 133★, pushed 2026-08-29
+skillmatic-ai/awesome-agent-skills                   # 666★, pushed 2026-05-14
+NousResearch/hermes-agent                            # 238,022★, pushed 2026-08-29
+googleworkspace/cli                                  # 30,635★, pushed 2026-08-25
+libukai/awesome-agent-skills                         # 5,024★, pushed 2026-08-05
+github/awesome-copilot                               # 38,409★, pushed 2026-08-29
+rohitg00/awesome-claude-design                       # 1,031★, pushed 2026-04-23
+jeecgboot/JeecgBoot                                  # 47,539★, pushed 2026-08-27
+zhayujie/CowAgent                                    # 46,719★, pushed 2026-08-27
+microsoft/SkillOpt                                   # 16,464★, pushed 2026-08-26
+antfu/skills                                         # 5,815★, pushed 2026-06-23
+dongshuyan/compass-skills                            # 712★, pushed 2026-08-26
+BrianRWagner/ai-marketing-claude-code-skills         # 404★, pushed 2026-03-19
+ScrapeCreators/social-media-research-skills          # 1,868★, pushed 2026-08-26
