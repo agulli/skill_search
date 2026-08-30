@@ -206,3 +206,30 @@ def test_health_endpoint_is_exempt_from_rate_limiting(server):
     # Health must answer under load, or checks fail exactly when it is busiest.
     for _ in range(60):
         assert httpx.get(server + "/health").status_code == 200
+
+
+def test_database_predating_a_migrated_column_still_opens(tmp_path):
+    """Indexes on migrated columns must be created after the migration.
+
+    A database created before `repo_score` existed failed to open at all: the
+    schema script tried to index a column the migration had not yet added, and
+    aborted before reaching it.
+    """
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    legacy = sqlite3.connect(db)
+    legacy.executescript(
+        "CREATE TABLE repos(full_name TEXT PRIMARY KEY, owner TEXT, name TEXT);"
+        "INSERT INTO repos VALUES('a/b','a','b');"
+    )
+    legacy.commit()
+    legacy.close()
+
+    store = Store(db)                       # must not raise
+    assert store.get_repo("a/b")["owner"] == "a"
+    cols = {r["name"] for r in store.db.execute("PRAGMA table_info(repos)")}
+    assert "repo_score" in cols             # migration ran
+    idx = {r[1] for r in store.db.execute("PRAGMA index_list(repos)")}
+    assert "repos_score" in idx             # and the index followed it
+    store.close()

@@ -10,6 +10,7 @@ outgrows it.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -72,7 +73,6 @@ CREATE TABLE IF NOT EXISTS repos (
 CREATE INDEX IF NOT EXISTS repos_last_crawled ON repos(last_crawled);
 CREATE INDEX IF NOT EXISTS repos_skill_count ON repos(skill_count);
 CREATE INDEX IF NOT EXISTS repos_stars ON repos(stars DESC);
-CREATE INDEX IF NOT EXISTS repos_score ON repos(repo_score DESC);
 
 -- Quantile boundaries per metric, so ranking can normalise heavy-tailed counts
 -- by percentile rather than by a hand-tuned constant.
@@ -167,6 +167,16 @@ CREATE TABLE IF NOT EXISTS crawl_log (
 """
 
 
+# Indexes on columns that `_migrate` adds must be created after it runs. A
+# database created before `repo_score` existed would otherwise fail to open at
+# all: the schema script would try to index a column the migration had not yet
+# added, and abort before reaching it.
+POST_MIGRATE_INDEXES = """
+CREATE INDEX IF NOT EXISTS repos_score ON repos(repo_score DESC);
+CREATE INDEX IF NOT EXISTS skills_category ON skills(category, subcategory);
+"""
+
+
 class Store:
     def __init__(self, path: Path | str, *, read_only: bool = False) -> None:
         """Open the corpus. `read_only` is for serving.
@@ -181,20 +191,27 @@ class Store:
         self.path = Path(path)
         self.read_only = read_only
 
+        # Batch writers hold long transactions — a full rerank rewrites every
+        # skill row in one statement — so a 30s busy timeout is not enough when
+        # discovery and harvesting run concurrently. Measured: 22 discovery
+        # batches were lost to lock timeouts before this was raised.
+        busy = float(os.getenv("SKILL_ENGINE_BUSY_TIMEOUT", "180"))
+
         if read_only:
             self.db = sqlite3.connect(
-                f"file:{self.path}?mode=ro", uri=True, timeout=30.0
+                f"file:{self.path}?mode=ro", uri=True, timeout=busy
             )
             self.db.row_factory = sqlite3.Row
             self._tune()
             return
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, timeout=30.0)
+        self.db = sqlite3.connect(self.path, timeout=busy)
         self.db.row_factory = sqlite3.Row
         self._tune()
         self.db.executescript(SCHEMA)
         self._migrate()
+        self.db.executescript(POST_MIGRATE_INDEXES)
         self.db.commit()
 
     def _tune(self) -> None:
