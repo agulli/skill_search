@@ -22,9 +22,18 @@ primary_region = 'lhr'
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = 'suspend'
+  # Kept warm rather than suspended, for two measured reasons.
+  #
+  # Fly judges idleness from HTTP traffic, so a long SSH upload generates none
+  # and the machine suspends underneath it — that killed a 2.6GB transfer
+  # mid-flight with 'remote command exited without exit status'.
+  #
+  # And a suspended machine wakes with an empty page cache. On an index this
+  # size a cold broad query measured ~13 seconds against ~90ms warm, which is
+  # the difference between a working site and a broken-looking one.
+  auto_stop_machines = 'off'
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
 
   [http_service.concurrency]
     type = 'requests'
