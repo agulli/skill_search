@@ -247,7 +247,10 @@ def test_server_starts_without_a_corpus(tmp_path):
     from skill_engine.serve import make_handler
 
     missing = tmp_path / "absent.db"
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(missing, "none"))
+    # read_only matters: a writable open would *create* the database and the
+    # test would silently assert nothing. Production serves read-only anyway.
+    srv = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler(missing, "none", read_only=True))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     base = f"http://127.0.0.1:{srv.server_address[1]}"
     try:
@@ -259,5 +262,34 @@ def test_server_starts_without_a_corpus(tmp_path):
         r = httpx.get(base + "/api/search", params={"q": "pdf"})
         assert r.status_code == 503
         assert "index not loaded" in r.json()["error"]
+        assert not missing.exists()      # and never created it
+    finally:
+        srv.shutdown(); srv.server_close()
+
+
+def test_a_truncated_corpus_degrades_instead_of_crashing(tmp_path):
+    """A half-written database is worse than none.
+
+    The file exists, so the server looks ready; then every request dies opening
+    it, which flaps the health check, stops the machine, and leaves no running
+    VM to upload a replacement to. That deadlocked a real deployment.
+    """
+    import threading
+    from http.server import ThreadingHTTPServer
+    from skill_engine.serve import make_handler
+
+    good = tmp_path / "good.db"
+    Store(good).close()
+    truncated = tmp_path / "truncated.db"
+    truncated.write_bytes(good.read_bytes()[:3000])   # a partial upload
+
+    srv = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler(truncated, "none", read_only=True))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        assert httpx.get(base + "/health").json()["index"] is False
+        assert httpx.get(base + "/api/search", params={"q": "x"}).status_code == 503
+        assert httpx.get(base + "/health").status_code == 200   # still alive
     finally:
         srv.shutdown(); srv.server_close()

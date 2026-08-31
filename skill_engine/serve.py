@@ -585,9 +585,16 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                 # start without the database, and the database cannot be
                 # uploaded without a running machine. The body reports whether
                 # an index is actually loaded.
-                ready = Path(str(db_path)).exists()
+                # Readable, not merely present: a truncated file exists but
+                # cannot be opened, and reporting that as ready is a lie that
+                # costs a deployment.
+                try:
+                    get_store(db_path, read_only)
+                    ready = True
+                except Exception:
+                    ready = False
                 body = b'{"ok":true,"index":true}' if ready else \
-                    b'{"ok":true,"index":false,"detail":"no corpus at this path yet"}'
+                    b'{"ok":true,"index":false,"detail":"no readable corpus yet"}'
                 return self._send(200, body, "application/json")
 
             if limiter is not None:
@@ -599,18 +606,23 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                     self.end_headers()
                     return
 
-            if not Path(str(db_path)).exists():
-                # Everything except liveness needs the corpus.
-                return self._json(503, {
-                    "error": "index not loaded",
-                    "detail": f"no database at {db_path}; upload one with "
-                              "./deploy.sh data",
-                })
-
             p = parse_qs(parsed.query)
             query = (p.get("q", [""])[0]).strip()
             limit = max(1, min(int(p.get("limit", ["20"])[0] or 20), 200))
-            store = get_store(db_path, read_only)
+
+            # A missing *or unreadable* corpus must degrade, not crash. A
+            # half-written database is worse than none: the file exists, so the
+            # server looks ready, then every request dies opening it — which
+            # flaps the health check, stops the machine, and leaves no running
+            # VM to upload a replacement to. That deadlocked a real deploy.
+            try:
+                store = get_store(db_path, read_only)
+            except Exception as exc:
+                return self._json(503, {
+                    "error": "index not loaded",
+                    "detail": f"{db_path} is missing or unreadable ({exc}); "
+                              "upload one with ./deploy.sh data",
+                })
 
             if parsed.path == "/":
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
