@@ -456,6 +456,16 @@ def cmd_categorize(args, cfg) -> None:
     store.close()
 
 
+def cmd_evaluate(args, cfg) -> None:
+    """Measure retrieval quality, not just that the code runs."""
+    from .evaluate import format_results, run_all
+
+    store = Store(cfg.db_path, read_only=True)
+    print(f"evaluating {cfg.db_path}")
+    print(format_results(run_all(store, quick=args.quick)))
+    store.close()
+
+
 def cmd_stats(args, cfg) -> None:
     store = Store(cfg.db_path)
     stats = store.stats()
@@ -614,6 +624,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     cz = sub.add_parser("categorize", help="sort skills into browsable categories")
     cz.set_defaults(func=cmd_categorize, is_async=False)
+
+    ev = sub.add_parser("evaluate", help="measure retrieval quality")
+    ev.add_argument("--quick", action="store_true", help="smaller samples")
+    ev.set_defaults(func=cmd_evaluate, is_async=False)
 
     st = sub.add_parser("stats", help="index statistics")
     st.set_defaults(func=cmd_stats, is_async=False)

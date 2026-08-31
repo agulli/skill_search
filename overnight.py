@@ -73,7 +73,7 @@ async def phase_sweep(store, cfg, target: int) -> int:
         concurrency=CONCURRENCY,
         max_mb=MAX_MB,
         batch=24,
-        rerank_every=2000,
+        rerank_every=int(os.getenv('SKILL_ENGINE_RERANK_EVERY', '2000')),
         on_progress=progress,
     )
     skills, _ = counts(store)

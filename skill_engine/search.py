@@ -57,6 +57,14 @@ STOPWORDS = {
     "it", "its", "this", "that", "these", "those", "i", "me", "my", "we", "our",
     "you", "your", "how", "do", "does", "can", "will", "would", "should",
     "use", "using", "used", "when", "want", "need", "make", "get",
+    # Conversational filler. These are *query-side* noise rather than corpus-side
+    # common words, so IDF cannot catch them — they are rare in skill
+    # descriptions, which makes the ranker treat them as highly discriminating
+    # and lets "please" reorder a third of the results. Kept deliberately short:
+    # words like "best" and "simple" look like filler but "best practices" and
+    # "simple" are real subject matter.
+    "please", "thanks", "thank", "kindly", "hi", "hello", "hey", "pls",
+    "looking", "wanna", "gonna", "somebody", "someone", "anyone",
 }
 
 

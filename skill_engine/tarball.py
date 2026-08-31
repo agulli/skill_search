@@ -25,6 +25,7 @@ import asyncio
 import io
 import json
 import logging
+import os
 import tarfile
 import time
 from typing import Any
@@ -231,7 +232,15 @@ async def run_tarball_crawl(
     """
     from .ranking import recompute
 
-    fetcher = TarballFetcher(concurrency=concurrency, max_bytes=max_mb * 1024 * 1024)
+    # The pacing floor caps request *starts* regardless of concurrency, so it
+    # sets the ceiling on throughput: 0.15s allows at most 6.7 repos/second no
+    # matter how many are in flight. Tunable because the right value depends on
+    # how the endpoint is behaving — watch the failure rate, not the clock.
+    fetcher = TarballFetcher(
+        concurrency=concurrency,
+        max_bytes=max_mb * 1024 * 1024,
+        min_delay=float(os.getenv("SKILL_ENGINE_MIN_DELAY", "0.15")),
+    )
     totals = {"repos": 0, "skills": 0, "empty": 0, "fallback": 0, "errors": 0}
     started = time.time()
     since_rerank = 0
