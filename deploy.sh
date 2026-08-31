@@ -39,13 +39,24 @@ deploy_data() {
   local staged="$DB"
   echo "==> uploading $DB ($(du -h "$DB" | cut -f1))"
 
-  # Upload compressed over SSH. sqlite files compress well — typically to about
-  # a third — and the volume has the disk to spare, not the bandwidth.
-  echo "==> uploading to $APP:/data/skills.db"
+  # Check the volume can actually hold it before spending the upload. The
+  # `initial_size` in fly.toml applies only when a volume is created — editing
+  # it later silently does nothing, which is how a 6.8GB index met a 3GB volume.
+  local need_gb
+  need_gb=$(( ($(wc -c < "$DB") / 1000000000) + 2 ))
+  echo "==> checking volume capacity (need ~${need_gb}GB)"
+  flyctl volumes list --app "$APP" || true
+  echo "    if the volume is smaller than ${need_gb}GB, extend it first:"
+  echo "      flyctl volumes extend <id> --size ${need_gb} --app $APP"
+
+  # Decompress inline rather than landing a .gz and expanding it. Writing both
+  # would need the compressed and uncompressed sizes at once — 9.4GB for a
+  # 6.8GB index — for no benefit.
+  echo "==> uploading to $APP:/data/skills.db (decompressed in flight)"
+  flyctl ssh console --app "$APP" --command "sh -c 'rm -f /data/skills.db /data/skills.db.gz'"
   gzip -c "$staged" | flyctl ssh console --app "$APP" \
-    --command "sh -c 'cat > /data/skills.db.gz'"
-  flyctl ssh console --app "$APP" --command \
-    "sh -c 'gunzip -f /data/skills.db.gz && ls -la /data/'"
+    --command "sh -c 'gunzip -c > /data/skills.db'"
+  flyctl ssh console --app "$APP" --command "sh -c 'ls -la /data/ && df -h /data'"
 
   echo "==> restarting so the new corpus is picked up"
   flyctl apps restart "$APP"
