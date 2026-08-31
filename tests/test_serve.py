@@ -233,3 +233,31 @@ def test_database_predating_a_migrated_column_still_opens(tmp_path):
     idx = {r[1] for r in store.db.execute("PRAGMA index_list(repos)")}
     assert "repos_score" in idx             # and the index followed it
     store.close()
+
+
+def test_server_starts_without_a_corpus(tmp_path):
+    """Deployment deadlocks otherwise.
+
+    The machine cannot start without the database, and the database cannot be
+    uploaded without a running machine. Liveness must therefore not depend on
+    the corpus being present — the first deploy hit exactly this.
+    """
+    import threading
+    from http.server import ThreadingHTTPServer
+    from skill_engine.serve import make_handler
+
+    missing = tmp_path / "absent.db"
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(missing, "none"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        health = httpx.get(base + "/health")
+        assert health.status_code == 200          # stays alive
+        assert health.json()["index"] is False    # but says it has no corpus
+
+        # Everything that needs the corpus fails clearly, not by crashing.
+        r = httpx.get(base + "/api/search", params={"q": "pdf"})
+        assert r.status_code == 503
+        assert "index not loaded" in r.json()["error"]
+    finally:
+        srv.shutdown(); srv.server_close()

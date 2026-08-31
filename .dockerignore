@@ -1,6 +1,9 @@
-# The corpus is shipped to the volume, never baked into the image — a 2.3GB
-# layer would make every deploy slow and every rollback expensive.
+# The corpus is shipped to the volume, never baked into the image — a multi-GB
+# layer would make every deploy slow and every rollback expensive. dist/ matters
+# just as much as data/: it is the release artifact, and leaving it out of this
+# file uploaded 6.8GB to the builder on every single deploy.
 data/
+dist/
 *.db
 *.db-wal
 *.db-shm

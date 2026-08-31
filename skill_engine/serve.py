@@ -26,6 +26,7 @@ import os
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .search import (browse, category_counts, count_matches, facet_counts,
@@ -579,7 +580,15 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
             # check failing under load would take the machine out exactly when
             # it is busiest.
             if parsed.path == "/health":
-                return self._send(200, b'{"ok":true}', "application/json")
+                # Liveness, not readiness. The container must stay up when the
+                # corpus is absent, or deployment deadlocks: the machine cannot
+                # start without the database, and the database cannot be
+                # uploaded without a running machine. The body reports whether
+                # an index is actually loaded.
+                ready = Path(str(db_path)).exists()
+                body = b'{"ok":true,"index":true}' if ready else \
+                    b'{"ok":true,"index":false,"detail":"no corpus at this path yet"}'
+                return self._send(200, body, "application/json")
 
             if limiter is not None:
                 ok, wait = limiter.allow(client_ip(self, trust_proxy))
@@ -589,6 +598,14 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
+
+            if not Path(str(db_path)).exists():
+                # Everything except liveness needs the corpus.
+                return self._json(503, {
+                    "error": "index not loaded",
+                    "detail": f"no database at {db_path}; upload one with "
+                              "./deploy.sh data",
+                })
 
             p = parse_qs(parsed.query)
             query = (p.get("q", [""])[0]).strip()
