@@ -5,13 +5,15 @@
 # writes to it. That is why this is two steps rather than one, and why the
 # container needs no GitHub credentials.
 #
+#   ./deploy.sh build      build a release index from the crawl database
 #   ./deploy.sh app        deploy the code only (fast, no upload)
-#   ./deploy.sh data       upload the database only
-#   ./deploy.sh all        both
+#   ./deploy.sh data       upload the release index
+#   ./deploy.sh all        build, deploy, upload
 set -euo pipefail
 
 APP="${FLY_APP:-searchskills}"
-DB="${SKILL_ENGINE_DB:-data/big.db}"
+CRAWL_DB="${SKILL_ENGINE_CRAWL_DB:-data/scale.db}"
+DB="${SKILL_ENGINE_DB:-dist/skills.db}"
 REGION="${FLY_REGION:-lhr}"
 STEP="${1:-all}"
 
@@ -23,18 +25,19 @@ deploy_app() {
   flyctl deploy --app "$APP" --ha=false
 }
 
-deploy_data() {
-  [ -f "$DB" ] || { echo "no database at $DB"; exit 1; }
+build_release() {
+  # A crawl database is not servable: scores are zero (reranking is disabled
+  # during harvest), categories are unassigned, and full bodies make it several
+  # times larger than it needs to be. release.py fixes all three and reports
+  # what volume to provision.
+  echo "==> building release index from $CRAWL_DB"
+  python release.py "$CRAWL_DB" "$DB"
+}
 
-  # Compact and vacuum into a throwaway copy first. VACUUM reclaims pages freed
-  # by the crawl and repacks the FTS index; on this corpus it is worth a few
-  # hundred MB, which is transfer time on every single deploy.
-  local staged="/tmp/skills-deploy.db"
-  echo "==> preparing $DB ($(du -h "$DB" | cut -f1))"
-  rm -f "$staged"
-  sqlite3 "$DB" "VACUUM INTO '$staged'"
-  sqlite3 "$staged" "INSERT INTO skills_fts(skills_fts) VALUES('optimize'); ANALYZE;"
-  echo "    staged: $(du -h "$staged" | cut -f1)"
+deploy_data() {
+  [ -f "$DB" ] || { echo "no release index at $DB — run './deploy.sh build' first"; exit 1; }
+  local staged="$DB"
+  echo "==> uploading $DB ($(du -h "$DB" | cut -f1))"
 
   # Upload compressed over SSH. sqlite files compress well — typically to about
   # a third — and the volume has the disk to spare, not the bandwidth.
@@ -44,16 +47,16 @@ deploy_data() {
   flyctl ssh console --app "$APP" --command \
     "sh -c 'gunzip -f /data/skills.db.gz && ls -la /data/'"
 
-  rm -f "$staged"
   echo "==> restarting so the new corpus is picked up"
   flyctl apps restart "$APP"
 }
 
 case "$STEP" in
-  app)  deploy_app ;;
-  data) deploy_data ;;
-  all)  deploy_app; deploy_data ;;
-  *)    echo "usage: $0 [app|data|all]"; exit 1 ;;
+  build) build_release ;;
+  app)   deploy_app ;;
+  data)  deploy_data ;;
+  all)   build_release; deploy_app; deploy_data ;;
+  *)     echo "usage: $0 [build|app|data|all]"; exit 1 ;;
 esac
 
 echo "==> done"
