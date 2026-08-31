@@ -19,9 +19,14 @@ Stages, in order, and why that order:
    catalogue ships complete.
 4. **Trim bodies** — measured at 61% smaller, 21x faster on broad queries, and
    *better* on every retrieval metric: truncating removes spurious matches deep
-   in long documents. Triggers are dropped first so a 600k-row rewrite does not
-   churn the index once per row, then the index is rebuilt once.
-5. **Reclaim** — a second `VACUUM` returns the freed pages to the filesystem.
+   in long documents.
+5. **Rebuild the index once**, then **reclaim** with a second `VACUUM`.
+
+The FTS triggers are dropped for the whole build, not just the trim. `skills_au`
+fires on *any* update to `skills`, and both ranking and categorising rewrite
+every row — so with triggers live, a 1M-skill build rewrites the full-text index
+a million times for columns that are not in it. Left in place, categorising
+alone grew the write-ahead log past 15GB and had not finished in 40 minutes.
 
 The full body stays in the crawl database, which is what the detail drawer reads
 locally; only the shipped copy is trimmed.
@@ -74,6 +79,16 @@ def main() -> int:
 
     store = Store(dst)
 
+    # Dropped for the entire build. `skills_au` fires on any update to `skills`,
+    # and rank, categorise and trim each rewrite every row — so leaving these in
+    # place rebuilds the full-text index once per row per stage, for columns the
+    # index does not even contain. The index is rebuilt once at the end instead.
+    t = step("drop FTS triggers for the build")
+    for trg in ("skills_ai", "skills_ad", "skills_au"):
+        store.db.execute(f"DROP TRIGGER IF EXISTS {trg}")
+    store.db.commit()
+    print(f"    done in {time.time()-t:.0f}s")
+
     t = step("rank (corpus-relative, so it needs everything present)")
     result = recompute(store)
     print(f"    {result['repos_scored']:,} repos, {result.get('authors_scored',0):,} "
@@ -85,11 +100,7 @@ def main() -> int:
     print(f"    {cats['classified']:,} skills in {time.time()-t:.0f}s")
     print("    " + ", ".join(f"{k} {v:,}" for k, v in top))
 
-    t = step(f"trim bodies to {BODY_CAP:,} chars and rebuild the index")
-    # Dropping the triggers first turns a per-row index churn into one bulk
-    # update followed by a single rebuild.
-    for trg in ("skills_ai", "skills_ad", "skills_au"):
-        store.db.execute(f"DROP TRIGGER IF EXISTS {trg}")
+    t = step(f"trim bodies to {BODY_CAP:,} chars")
     n = store.db.execute(
         "SELECT COUNT(*) FROM skills WHERE LENGTH(body) > ?", (BODY_CAP,)
     ).fetchone()[0]
@@ -98,9 +109,15 @@ def main() -> int:
         (BODY_CAP, BODY_CAP),
     )
     store.db.commit()
+    print(f"    {n:,} bodies truncated in {time.time()-t:.0f}s")
+
+    t = step("rebuild the full-text index once, from the finished content")
     store.db.execute("INSERT INTO skills_fts(skills_fts) VALUES('rebuild')")
     store.db.commit()
-    # Recreate the triggers so the shipped file stays correct if ever written to.
+    print(f"    done in {time.time()-t:.0f}s")
+
+    t = step("restore triggers")
+    # Recreated so the shipped file stays correct if it is ever written to.
     store.db.executescript("""
     CREATE TRIGGER IF NOT EXISTS skills_ai AFTER INSERT ON skills BEGIN
       INSERT INTO skills_fts(rowid,name,description,body,repo,path)
@@ -117,7 +134,7 @@ def main() -> int:
       VALUES (new.id,new.name,new.description,new.body,new.repo,new.path);
     END;""")
     store.db.commit()
-    print(f"    {n:,} bodies truncated in {time.time()-t:.0f}s")
+    print(f"    done in {time.time()-t:.0f}s")
     store.close()
 
     t = step("reclaim freed pages")

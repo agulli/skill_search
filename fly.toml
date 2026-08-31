@@ -1,54 +1,43 @@
-# fly.io deployment for searchskills.ai
+# fly.toml app configuration file generated for searchskills on 2026-08-31T13:18:27+02:00
 #
-# Sizing is measured, not guessed. On the deployed corpus, a broad query that
-# matches 43,798 skills costs 100ms at 189MB resident (cache 192MB, mmap off).
-# Enabling mmap reaches 95ms but 517MB, which does not fit here — so mmap is off
-# and the memory goes to the page cache instead.
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
-# The volume holds the database, which is rebuilt offline and uploaded; the
-# container never writes to it. VACUUM shrinks the corpus 2.49GB -> 1.47GB, so
-# 3GB leaves room to grow.
 
-app = "searchskills"
-primary_region = "lhr"          # London; move nearer your users if that changes
+app = 'searchskills'
+primary_region = 'lhr'
 
 [build]
-
 [env]
-  SKILL_ENGINE_DB = "/data/skills.db"
-  SKILL_ENGINE_PUBLIC = "1"     # read-only DB + rate limiter + trust proxy IP
-  SKILL_ENGINE_CACHE_MB = "192"
-  SKILL_ENGINE_MMAP_MB = "0"
-  SKILL_ENGINE_RATE = "4"       # sustained requests/second per client IP
+  SKILL_ENGINE_CACHE_MB = '192'
+  SKILL_ENGINE_DB = '/data/skills.db'
+  SKILL_ENGINE_MMAP_MB = '0'
+  SKILL_ENGINE_PUBLIC = '1'
+  SKILL_ENGINE_RATE = '4'
 
 [[mounts]]
-  source = "corpus"
-  destination = "/data"
-  initial_size = "3gb"
+  source = 'corpus'
+  destination = '/data'
+  initial_size = '3gb'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "suspend"
-  # Suspend rather than stop when idle, and keep zero machines warm: this is a
-  # low-traffic read-only service, and a suspended machine resumes in well under
-  # a second. It is the difference between paying for a month and paying for the
-  # minutes someone is actually searching.
+  auto_stop_machines = 'suspend'
   auto_start_machines = true
   min_machines_running = 0
 
   [http_service.concurrency]
-    type = "requests"
-    soft_limit = 40
+    type = 'requests'
     hard_limit = 80
+    soft_limit = 40
 
   [[http_service.checks]]
-    interval = "30s"
-    timeout = "4s"
-    grace_period = "10s"
-    method = "GET"
-    path = "/health"
+    interval = '30s'
+    timeout = '4s'
+    grace_period = '10s'
+    method = 'GET'
+    path = '/health'
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "512mb"
+  size = 'shared-cpu-1x'
+  memory = '512mb'
