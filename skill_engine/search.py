@@ -118,7 +118,7 @@ class Hit:
         }
 
 
-def to_fts_query(raw: str) -> str:
+def to_fts_query(raw: str, conjunctive: bool = False) -> str:
     """Turn user text into an FTS5 MATCH expression that cannot throw.
 
     FTS5 raises on unbalanced quotes and stray operators, so every term is
@@ -131,13 +131,18 @@ def to_fts_query(raw: str) -> str:
     took 1.6 seconds. Removing them leaves the terms that actually discriminate.
     Dropped only when something survives — a search for "the" should still
     search for "the" rather than silently return nothing.
+
+    `conjunctive` requires every term instead of any. See `keyword_search` for
+    why that matters: at a million skills, OR-ing three ordinary words matches
+    a third of the corpus.
     """
     terms = [t for t in re.split(r"\s+", FTS_SPECIAL.sub(" ", raw).strip()) if t]
     if not terms:
         return ""
     kept = [t for t in terms if t.lower() not in STOPWORDS]
     terms = kept or terms
-    return " OR ".join(f'"{t}"*' if len(t) > 2 else f'"{t}"' for t in terms)
+    joiner = " AND " if conjunctive else " OR "
+    return joiner.join(f'"{t}"*' if len(t) > 2 else f'"{t}"' for t in terms)
 
 
 def _where(filters: dict[str, Any]) -> tuple[str, list[Any]]:
@@ -186,7 +191,10 @@ def count_matches(store: Store, query: str, filters: dict | None = None) -> int:
     snippet extraction — the two expensive parts — so it stays cheap enough to
     show a live result count.
     """
-    fts = to_fts_query(query)
+    # Count what the search actually matched. Reporting the any-term total
+    # beside all-term results would tell the user 283,604 when the engine
+    # ranked 1,609 — a number describing a query that was never run.
+    fts = to_fts_query(query, conjunctive=True)
     if not fts:
         return 0
     where, params = _where(filters or {})
@@ -198,9 +206,23 @@ def count_matches(store: Store, query: str, filters: dict | None = None) -> int:
                 WHERE skills_fts MATCH ? AND {where}""",
             [fts, *params],
         ).fetchone()
-        return row["c"] if row else 0
+        n = row["c"] if row else 0
     except Exception:
         return 0
+    if n >= CONJUNCTIVE_FLOOR:
+        return n
+    # The search fell back to any-term, so the count must too.
+    try:
+        row = store.db.execute(
+            f"""SELECT COUNT(*) c FROM skills_fts
+                JOIN skills s ON s.id = skills_fts.rowid
+                JOIN repos  r ON r.full_name = s.repo
+                WHERE skills_fts MATCH ? AND {where}""",
+            [to_fts_query(query), *params],
+        ).fetchone()
+        return row["c"] if row else 0
+    except Exception:
+        return n
 
 
 def facet_counts(store: Store, query: str, filters: dict | None = None,
@@ -249,10 +271,35 @@ def facet_counts(store: Store, query: str, filters: dict | None = None,
     }
 
 
+# Below this many results, an all-terms query is considered too narrow and the
+# any-term form is used instead. Set where a first page still fills comfortably.
+CONJUNCTIVE_FLOOR = 25
+
+
 def keyword_search(
     store: Store, query: str, limit: int = 100, filters: dict | None = None
 ) -> list[Hit]:
-    fts = to_fts_query(query)
+    """BM25 retrieval, requiring all query terms before falling back to any.
+
+    Pure OR does not survive corpus growth. At 100k skills "review react
+    accessibility" matched 43,798 documents and ranked in 200ms; at a million it
+    matched 297,657 — 30% of everything — and took 1.3 seconds, because the
+    engine sorts every match to find the best hundred.
+
+    Requiring all terms cuts that same query to 1,609 documents, a 185x
+    reduction, and is usually what the searcher meant. But it can be too strict,
+    so a result set under `CONJUNCTIVE_FLOOR` falls back to any-term matching:
+    precision when the corpus can afford it, recall when it cannot.
+    """
+    return _keyword_search(store, query, limit, filters, conjunctive=True) or \
+        _keyword_search(store, query, limit, filters, conjunctive=False)
+
+
+def _keyword_search(
+    store: Store, query: str, limit: int = 100, filters: dict | None = None,
+    conjunctive: bool = False,
+) -> list[Hit]:
+    fts = to_fts_query(query, conjunctive=conjunctive)
     if not fts:
         return []
     where, params = _where(filters or {})
@@ -275,7 +322,7 @@ def keyword_search(
     except Exception:
         return []
 
-    return [
+    hits = [
         Hit(
             skill_id=r["id"], repo=r["repo"], path=r["path"], name=r["name"],
             description=r["description"], source_kind=r["source_kind"],
@@ -287,6 +334,10 @@ def keyword_search(
         )
         for r in rows
     ]
+    # Too few for an all-terms query means the caller should retry permissively.
+    if conjunctive and len(hits) < CONJUNCTIVE_FLOOR:
+        return []
+    return hits
 
 
 def vector_search(

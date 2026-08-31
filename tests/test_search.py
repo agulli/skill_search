@@ -240,3 +240,25 @@ def test_stopword_removal_preserves_relevance(store):
     with_stops = search(store, "extract the tables from a pdf")
     without = search(store, "extract tables pdf")
     assert with_stops and with_stops[0].name == without[0].name
+
+
+def test_all_terms_required_before_falling_back(store):
+    """OR semantics stopped scaling: at 1M skills, three ordinary words
+    matched 30% of the corpus and the engine sorted all of it."""
+    assert " AND " in to_fts_query("review react accessibility", conjunctive=True)
+    assert " OR " in to_fts_query("review react accessibility")
+
+
+def test_narrow_queries_fall_back_so_recall_survives(store):
+    """A strict query returning almost nothing must not return nothing."""
+    # No single skill mentions all three, so the all-terms form finds too few.
+    hits = search(store, "pdf kubernetes fortran")
+    assert hits, "fallback to any-term matching should still find something"
+
+
+def test_reported_total_describes_the_query_that_ran(store):
+    """Showing the any-term count beside all-term results is a lie."""
+    from skill_engine.search import count_matches
+    _add_pdf_variants(store, "acme/docs", 40, score=80.0)
+    narrow = count_matches(store, "pdf tables extraction")
+    assert narrow > 0

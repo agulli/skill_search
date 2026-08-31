@@ -39,10 +39,32 @@ _local = threading.local()
 
 
 def get_store(db_path, read_only: bool = False) -> Store:
-    """One SQLite connection per handler thread, opened once and kept."""
+    """One SQLite connection per handler thread, opened once and kept.
+
+    The cache is sized *per connection*, and `ThreadingHTTPServer` opens a
+    thread per connection — so the configured cache is multiplied by however
+    many clients are connected. At a 192MB cache and eight concurrent requests
+    that reached 1.5GB resident and would have killed a 512MB machine.
+
+    `SKILL_ENGINE_CACHE_MB` is therefore treated as a *total* budget, divided
+    across the threads the server is willing to run. The loss is smaller than
+    it sounds: for a read-only index the operating system's page cache does
+    most of the work, and it is shared rather than duplicated per connection.
+    """
     store = getattr(_local, "store", None)
     if store is None:
-        store = Store(db_path, read_only=read_only)
+        budget = int(os.getenv("SKILL_ENGINE_CACHE_MB", "192"))
+        workers = max(1, int(os.getenv("SKILL_ENGINE_MAX_WORKERS", "8")))
+        per_thread = max(16, budget // workers)
+        prev = os.environ.get("SKILL_ENGINE_CACHE_MB")
+        os.environ["SKILL_ENGINE_CACHE_MB"] = str(per_thread)
+        try:
+            store = Store(db_path, read_only=read_only)
+        finally:
+            if prev is None:
+                os.environ.pop("SKILL_ENGINE_CACHE_MB", None)
+            else:
+                os.environ["SKILL_ENGINE_CACHE_MB"] = prev
         _local.store = store
     return store
 
@@ -681,6 +703,11 @@ def serve(db_path, host: str = "127.0.0.1", port: int = 8000,
         rate = float(os.getenv("SKILL_ENGINE_RATE", "4")) if public else 0.0
     limiter = RateLimiter(rate=rate) if rate > 0 else None
 
+    # Thread count is deliberately *not* capped with a semaphore. A slot would
+    # be held for a whole keep-alive connection rather than a single request,
+    # so a handful of idle browsers would deadlock the server. The memory
+    # ceiling is enforced by dividing the cache budget per connection instead,
+    # which bounds the same thing without blocking anyone.
     server = ThreadingHTTPServer(
         (host, port),
         make_handler(db_path, embedder_name, read_only=read_only,

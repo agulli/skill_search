@@ -17,7 +17,7 @@ primary_region = 'lhr'
 [[mounts]]
   source = 'corpus'
   destination = '/data'
-  initial_size = '3gb'
+  initial_size = '12gb'
 
 [http_service]
   internal_port = 8080
