@@ -293,3 +293,24 @@ def test_a_truncated_corpus_degrades_instead_of_crashing(tmp_path):
         assert httpx.get(base + "/health").status_code == 200   # still alive
     finally:
         srv.shutdown(); srv.server_close()
+
+
+def test_static_page_is_cacheable_but_searches_are_not(server):
+    """Cloudflare reported cf-cache-status: DYNAMIC and proxied everything.
+
+    Without an explicit header a CDN assumes nothing is cacheable, so a 21KB
+    page identical for every visitor was fetched from the origin every time —
+    the difference between ~20ms and ~250ms.
+    """
+    page = httpx.get(server + "/")
+    assert "s-maxage" in page.headers["cache-control"]
+
+    cats = httpx.get(server + "/api/categories")
+    assert "s-maxage" in cats.headers["cache-control"]
+
+    # Results depend on filters and must never be served to another visitor.
+    hits = httpx.get(server + "/api/search", params={"q": "pdf"})
+    assert hits.headers["cache-control"] == "no-store"
+
+    # Liveness must always reflect the current process.
+    assert "cache-control" not in httpx.get(server + "/health").headers

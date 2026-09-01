@@ -36,6 +36,10 @@ from .store import Store
 
 log = logging.getLogger("skill_engine.serve")
 
+# One hour at the CDN, one minute in the browser. The page only changes on a
+# redeploy, and a stale edge copy is purged by Cloudflare on demand anyway.
+PAGE_CACHE = "public, max-age=60, s-maxage=3600"
+
 _local = threading.local()
 
 
@@ -541,17 +545,24 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
         server_version = "skill-engine"
         sys_version = ""          # do not advertise the Python version
 
-        def _send(self, code: int, body: bytes, ctype: str) -> None:
+        def _send(self, code: int, body: bytes, ctype: str,
+                  cache: str | None = None) -> None:
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Access-Control-Allow-Origin", "*")
+            if cache:
+                self.send_header("Cache-Control", cache)
             self.end_headers()
             self.wfile.write(body)
 
-        def _json(self, code: int, payload) -> None:
+        def _json(self, code: int, payload, cache: str | None = None) -> None:
+            # API responses default to no-store. Search results depend on
+            # filters, on the corpus, and on nothing a shared cache can reason
+            # about safely — caching them at an edge would serve one visitor's
+            # query to another.
             self._send(code, json.dumps(payload, default=str).encode(),
-                       "application/json")
+                       "application/json", cache=cache or "no-store")
 
         def log_message(self, fmt, *args):
             log.debug(fmt, *args)
@@ -625,7 +636,15 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                 })
 
             if parsed.path == "/":
-                return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+                # The landing page is one static string, identical for everyone,
+                # so it should be served from a CDN edge rather than fetched
+                # from the origin every time. Without an explicit header
+                # Cloudflare reports cf-cache-status: DYNAMIC and proxies every
+                # request through — the difference between ~20ms and ~250ms.
+                # s-maxage targets the CDN; max-age keeps the browser copy
+                # short-lived so a redeploy is picked up quickly.
+                return self._send(200, PAGE.encode(), "text/html; charset=utf-8",
+                                  cache=PAGE_CACHE)
 
             if parsed.path == "/api/search":
                 if not query:
@@ -674,6 +693,8 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                                   data or {"error": "not found"})
 
             if parsed.path == "/api/categories":
+                # The one genuinely static API response: the directory tree
+                # changes only when the corpus is rebuilt.
                 counts = category_counts(store)
                 tree = []
                 for cat in category_tree():
@@ -688,7 +709,8 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                     tree.append(cat)
                 tree.sort(key=lambda c: -c["count"])
                 return self._json(200, {"categories": tree,
-                                        "total": sum(c["count"] for c in tree)})
+                                        "total": sum(c["count"] for c in tree)},
+                                  cache=PAGE_CACHE)
 
             if parsed.path == "/api/browse":
                 category = p.get("c", [""])[0]
