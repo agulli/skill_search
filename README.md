@@ -19,7 +19,9 @@ skill-engine serve                          # UI + API on :8000
 ```
 
 No GitHub token is required. 📄 **[whitepaper.md](whitepaper.md)** covers the
-full design and the reasoning behind each choice.
+full design and the reasoning behind each choice; **[ABUSE.md](ABUSE.md)**
+covers what the public deployment defends against, and what it deliberately
+does not.
 
 ---
 
