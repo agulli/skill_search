@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import hashlib
 import os
 import threading
 import time
@@ -39,6 +40,38 @@ log = logging.getLogger("skill_engine.serve")
 # One hour at the CDN, one minute in the browser. The page only changes on a
 # redeploy, and a stale edge copy is purged by Cloudflare on demand anyway.
 PAGE_CACHE = "public, max-age=60, s-maxage=3600"
+
+# Enumeration limits. The corpus itself is public GitHub content and cannot be
+# made secret — anyone can rebuild it from source. What these protect is the
+# service's availability and the derived work in it: the ranking, the author
+# reputation, the taxonomy.
+MAX_PAGE = int(os.getenv("SKILL_ENGINE_MAX_PAGE", "50"))
+MAX_OFFSET = int(os.getenv("SKILL_ENGINE_MAX_OFFSET", "1000"))
+
+# What each endpoint costs against a client's budget. Search and browse do real
+# work over the index; the page and the category list are static or cached.
+# A deep offset is charged extra because paging far into a category is a
+# browsing pattern no human produces — it is how a category gets walked.
+COSTS = {"/api/search": 3.0, "/api/browse": 3.0, "/api/skill": 1.0,
+         "/api/categories": 0.5, "/": 0.25, "/robots.txt": 0.0, "/health": 0.0}
+
+
+def request_cost(path: str, params: dict) -> float:
+    cost = COSTS.get(path, 1.0)
+    try:
+        cost += min(int(params.get("offset", ["0"])[0] or 0), MAX_OFFSET) / 200.0
+        cost *= 1.0 + min(int(params.get("limit", ["20"])[0] or 20), MAX_PAGE) / 100.0
+    except (ValueError, TypeError):
+        pass
+    return cost
+
+
+ROBOTS = """User-agent: *
+Allow: /$
+Allow: /api/categories
+Disallow: /api/
+Crawl-delay: 10
+""".encode()
 
 _local = threading.local()
 
@@ -85,17 +118,37 @@ class RateLimiter:
 
     Deliberately in-memory and per-process: no Redis, no coordination. It bounds
     what a single machine will do, which is the property that matters here.
+
+    Burst and rate defend different things, and conflating them is what made
+    the original settings useless. **Burst** protects real people: the search
+    box debounces at 110ms, so someone typing and correcting a query fires
+    several searches within a second or two, and a tight burst would throttle
+    them mid-sentence. **Rate** is what bounds a scraper, because sustained
+    extraction is a marathon and a one-off burst barely moves it.
+
+    So burst stays generous (30 tokens, about eight searches back to back) while
+    the sustained rate is low. Before, a flat cost of 1 and a burst of 40 gave a
+    client forty *searches* instantly and 14,400 an hour; the same burst now
+    buys eight, and the weighted cost brings the hourly ceiling down with it.
     """
 
-    def __init__(self, rate: float = 4.0, burst: int = 40, max_clients: int = 20_000):
+    def __init__(self, rate: float = 3.0, burst: int = 30, max_clients: int = 50_000):
         self.rate = rate            # sustained requests/second
         self.burst = burst          # bucket depth
         self.max_clients = max_clients
         self._buckets: dict[str, tuple[float, float]] = {}
         self._lock = threading.Lock()
 
-    def allow(self, client: str) -> tuple[bool, float]:
-        """Returns (allowed, seconds to wait if not)."""
+    def allow(self, client: str, cost: float = 1.0) -> tuple[bool, float]:
+        """Returns (allowed, seconds to wait if not).
+
+        `cost` exists because the endpoints are not equally expensive. Serving
+        the cached landing page is nearly free; a full-text query over a 0.6GB
+        index with facet counts is thousands of times dearer. Charging both one
+        token meant the limit was set by the cheap request — loose enough to be
+        polite to browsers, and therefore far too loose for the endpoint that
+        actually costs something.
+        """
         now = time.monotonic()
         with self._lock:
             # Cheap bound on memory: a flood of unique IPs cannot grow this
@@ -105,11 +158,30 @@ class RateLimiter:
 
             tokens, last = self._buckets.get(client, (float(self.burst), now))
             tokens = min(self.burst, tokens + (now - last) * self.rate)
-            if tokens < 1.0:
+            if tokens < cost:
                 self._buckets[client] = (tokens, now)
-                return False, (1.0 - tokens) / self.rate
-            self._buckets[client] = (tokens - 1.0, now)
+                # A zero refill rate means "never refills"; dividing by it to
+                # compute Retry-After raises, and an exception inside the
+                # limiter fails the request path open — the one place a crash
+                # must not happen, because it disables the defence entirely.
+                wait = (cost - tokens) / self.rate if self.rate > 0 else 3600.0
+                return False, wait
+            self._buckets[client] = (tokens - cost, now)
             return True, 0.0
+
+
+_SALT = os.urandom(16)
+
+
+def _pseudonym(ip: str) -> str:
+    """A stable per-process handle for a client, not their address.
+
+    Enough to tell "one client made 9,000 requests" from "9,000 clients made
+    one", which is the entire question when judging whether traffic is abuse.
+    Salted per process and truncated, so the logs never carry an IP address and
+    the handles cannot be correlated across restarts.
+    """
+    return hashlib.blake2s(_SALT + ip.encode(), digest_size=4).hexdigest()
 
 
 def client_ip(handler, trust_proxy: bool) -> str:
@@ -610,6 +682,12 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
             # Liveness must answer even when the limiter is angry, or a health
             # check failing under load would take the machine out exactly when
             # it is busiest.
+            if parsed.path == "/robots.txt":
+                # Honest crawlers are told to leave the API alone. It stops
+                # well-behaved bots indexing 100k result pages; it does nothing
+                # about anyone who ignores it, which is what the limiter is for.
+                return self._send(200, ROBOTS, "text/plain", cache=PAGE_CACHE)
+
             if parsed.path == "/health":
                 # Liveness, not readiness. The container must stay up when the
                 # corpus is absent, or deployment deadlocks: the machine cannot
@@ -628,9 +706,20 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                     b'{"ok":true,"index":false,"detail":"no readable corpus yet"}'
                 return self._send(200, body, "application/json")
 
+            p_early = parse_qs(parsed.query)
             if limiter is not None:
-                ok, wait = limiter.allow(client_ip(self, trust_proxy))
+                who = client_ip(self, trust_proxy)
+                ok, wait = limiter.allow(
+                    who, request_cost(parsed.path, p_early))
                 if not ok:
+                    # Logged at WARNING: this is the only signal that anyone is
+                    # hammering the index, and until now nothing was recorded at
+                    # all — request logging sat at DEBUG under an INFO root, so
+                    # the server was blind to its own traffic and a scraping
+                    # report could be neither confirmed nor refuted.
+                    log.warning("throttled client=%s path=%s ua=%r",
+                                _pseudonym(who), parsed.path,
+                                (self.headers.get("User-Agent") or "")[:80])
                     self.send_response(429)
                     self.send_header("Retry-After", str(max(1, int(wait) + 1)))
                     self.send_header("Content-Length", "0")
@@ -639,7 +728,10 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
 
             p = parse_qs(parsed.query)
             query = (p.get("q", [""])[0]).strip()
-            limit = max(1, min(int(p.get("limit", ["20"])[0] or 20), 200))
+            # 200 made the whole corpus about 500 requests to enumerate. 50 is
+            # more than any interface shows at once and multiplies the effort
+            # of bulk extraction fourfold.
+            limit = max(1, min(int(p.get("limit", ["20"])[0] or 20), MAX_PAGE))
 
             # A missing *or unreadable* corpus must degrade, not crash. A
             # half-written database is worse than none: the file exists, so the
@@ -753,7 +845,10 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                 if not category:
                     return self._json(400, {"error": "missing ?c="})
                 sub = p.get("sub", [None])[0] or None
-                offset = max(0, int(p.get("offset", ["0"])[0] or 0))
+                # Deep offsets serve no browsing purpose — nobody pages to
+                # result 50,000 by hand — but they are exactly how a category
+                # gets walked end to end.
+                offset = max(0, min(int(p.get("offset", ["0"])[0] or 0), MAX_OFFSET))
                 sort = p.get("sort", ["quality"])[0]
                 t0 = _t.perf_counter()
                 hits, total = browse(store, category, sub, limit=limit,
@@ -787,7 +882,10 @@ def serve(db_path, host: str = "127.0.0.1", port: int = 8000,
     read_only = public if read_only is None else read_only
     trust_proxy = public if trust_proxy is None else trust_proxy
     if rate is None:
-        rate = float(os.getenv("SKILL_ENGINE_RATE", "4")) if public else 0.0
+        # Must match RateLimiter's own default, or the env default silently
+        # overrides it and the class signature documents a limit that is never
+        # the one in force.
+        rate = float(os.getenv("SKILL_ENGINE_RATE", "3")) if public else 0.0
     limiter = RateLimiter(rate=rate) if rate > 0 else None
 
     # Thread count is deliberately *not* capped with a semaphore. A slot would
@@ -803,7 +901,7 @@ def serve(db_path, host: str = "127.0.0.1", port: int = 8000,
     server.daemon_threads = True
     mode = "read-only" if read_only else "read-write"
     print(f"skill-engine serving on http://{host}:{port}  ({mode}"
-          f"{f', {rate:g} req/s/client' if limiter else ''})")
+          f"{f', {rate:g} tokens/s/client' if limiter else ''})")
     print(f"  UI    http://{host}:{port}/")
     print(f"  API   http://{host}:{port}/api/search?q=pdf&facets=1")
     try:

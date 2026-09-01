@@ -375,3 +375,83 @@ def test_missing_catalogue_does_not_break_the_page(tmp_path):
         assert httpx.get(base + "/api/categories").status_code == 200
     finally:
         srv.shutdown(); srv.server_close()
+
+
+# ------------------------------------------------------- abuse resistance
+
+
+def test_limiter_charges_by_cost():
+    """An expensive endpoint must drain the budget faster than a cheap one."""
+    from skill_engine.serve import RateLimiter
+
+
+    cheap = RateLimiter(rate=0.0, burst=10)
+    for _ in range(10):
+        assert cheap.allow("a", 1.0)[0]
+    assert not cheap.allow("a", 1.0)[0]
+
+    dear = RateLimiter(rate=0.0, burst=10)
+    for _ in range(2):
+        assert dear.allow("b", 4.0)[0]
+    assert not dear.allow("b", 4.0)[0]
+
+
+def test_search_costs_more_than_page_view():
+    """Serving the cached page must not be rationed like a full-text query."""
+    from skill_engine.serve import request_cost
+
+    assert request_cost("/api/search", {}) > 4 * request_cost("/", {})
+    assert request_cost("/health", {}) == 0.0
+
+
+def test_deep_offset_costs_more_than_shallow():
+    """Walking a category end to end must get progressively more expensive."""
+    from skill_engine.serve import request_cost
+
+    shallow = request_cost("/api/browse", {"offset": ["0"]})
+    deep = request_cost("/api/browse", {"offset": ["1000"]})
+    assert deep > shallow * 2
+
+
+def test_request_cost_survives_junk_parameters():
+    """Hostile input must not crash the limiter — that would disable it."""
+    from skill_engine.serve import request_cost
+
+    for junk in ({"offset": ["abc"]}, {"limit": ["-"]}, {"offset": [""]},
+                 {"limit": ["9" * 400]}):
+        assert request_cost("/api/search", junk) > 0
+
+
+def test_pseudonym_is_stable_and_hides_the_address():
+    """Logs must distinguish clients without recording who they are."""
+    from skill_engine.serve import _pseudonym
+
+    assert _pseudonym("203.0.113.7") == _pseudonym("203.0.113.7")
+    assert _pseudonym("203.0.113.7") != _pseudonym("203.0.113.8")
+    assert "203.0.113.7" not in _pseudonym("203.0.113.7")
+
+
+def test_enumeration_budget_is_bounded():
+    """The corpus must not be walkable in a trivial number of requests.
+
+    With a 200-result page and no offset ceiling, 100k skills came out in about
+    500 requests. This asserts the shape of the fix, not a specific number.
+    """
+    from skill_engine.serve import MAX_PAGE, MAX_OFFSET, request_cost
+
+    assert MAX_PAGE <= 50
+    assert MAX_OFFSET <= 1000
+    # A maximally greedy request must cost several times a modest one.
+    greedy = request_cost("/api/browse",
+                          {"limit": [str(MAX_PAGE)], "offset": [str(MAX_OFFSET)]})
+    assert greedy > 3 * request_cost("/api/browse", {"limit": ["10"]})
+
+
+def test_limiter_never_raises_when_refill_is_zero():
+    """An exception in the limiter fails open — it must not divide by zero."""
+    from skill_engine.serve import RateLimiter
+
+    lim = RateLimiter(rate=0.0, burst=1)
+    assert lim.allow("x", 1.0)[0]
+    ok, wait = lim.allow("x", 1.0)      # must not raise
+    assert not ok and wait > 0
