@@ -12,7 +12,11 @@
 set -euo pipefail
 
 APP="${FLY_APP:-searchskills}"
-CRAWL_DB="${SKILL_ENGINE_CRAWL_DB:-data/scale.db}"
+# The corpus actually being served. data/scale.db holds the 1M crawl, which
+# needs a 2GB machine — building from it by default silently produced an
+# artifact too large for the deployed instance. Override to switch corpus:
+#   SKILL_ENGINE_CRAWL_DB=data/scale.db ./deploy.sh build
+CRAWL_DB="${SKILL_ENGINE_CRAWL_DB:-data/big.db}"
 DB="${SKILL_ENGINE_DB:-dist/skills.db}"
 REGION="${FLY_REGION:-lhr}"
 STEP="${1:-all}"
