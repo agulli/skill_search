@@ -149,7 +149,8 @@ a{color:inherit}
 header{position:sticky;top:0;z-index:20;background:var(--bg);
   border-bottom:1px solid var(--line)}
 .bar{max-width:1120px;margin:0 auto;padding:14px 20px;display:flex;gap:14px;align-items:center}
-.brand{font-weight:650;font-size:15px;letter-spacing:-.01em;white-space:nowrap}
+.brand{font-weight:650;font-size:15px;letter-spacing:-.01em;white-space:nowrap;cursor:pointer}
+.brand:hover{color:var(--accent)}
 .brand span{color:var(--muted);font-weight:400}
 /* The corpus count is the first thing to go when the bar gets tight — the
    search box matters more than the statistic. */
@@ -264,7 +265,7 @@ select,input[type=number]{width:100%;padding:6px 8px;border:1px solid var(--line
 @keyframes sp{to{transform:rotate(360deg)}}
 </style></head><body>
 <header><div class="bar">
-  <div class="brand">Agent Skills Search by AGI <span id="corpus"></span></div>
+  <div class="brand" id="home" title="Back to the directory">Agent Skills Search by AGI <span id="corpus"></span></div>
   <div class="searchwrap">
     <input id="q" type="search" autocomplete="off" spellcheck="false"
            placeholder="Describe what you need — e.g. extract tables from a PDF invoice">
@@ -288,6 +289,11 @@ const EX=["extract tables from a pdf invoice","write terraform modules for aws",
 let state={q:"",limit:20,kind:"",license:"",language:"",min_stars:0,min_score:0,
            max_age_days:0,forks:0,cat:"",sub:"",sort:"quality",offset:0};
 let CATS=null;
+// Every render is stamped with a ticket. A response that finishes after a
+// newer one started is discarded rather than painted: without this, the
+// directory's category fetch could land on top of search results the user had
+// already triggered, mixing the two views on screen.
+let TICKET=0;
 let inflight=null;
 
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -311,9 +317,13 @@ function syncURL(){
   history.replaceState({},"",u);
 }
 
-async function renderDirectory(){
+async function renderDirectory(mine){
   $("#facets").innerHTML=""; $("#meta").innerHTML="";
-  if(!CATS){ CATS=await (await fetch("/api/categories")).json(); }
+  if(!CATS){
+    $("#results").innerHTML='<div class="hint"><span class="spin"></span> loading the directory…</div>';
+    CATS=await (await fetch("/api/categories")).json();
+  }
+  if(mine!==TICKET) return;                       // a newer view won
   const cards=CATS.categories.map(c=>`
     <div class="cat" data-cat="${esc(c.id)}">
       <div class="top"><span class="ico">${c.icon}</span>
@@ -329,13 +339,16 @@ async function renderDirectory(){
      <div class="grid">${cards}</div>`;
 }
 
-async function renderCategory(){
+async function renderCategory(mine){
+  if(!CATS){ CATS=await (await fetch("/api/categories")).json(); }
+  if(mine!==TICKET) return;
   const cat=CATS.categories.find(c=>c.id===state.cat);
-  if(!cat) return renderDirectory();
+  if(!cat) return renderDirectory(mine);
   const p=new URLSearchParams({c:state.cat,limit:state.limit,offset:state.offset,sort:state.sort});
   if(state.sub) p.set("sub",state.sub);
   $("#meta").innerHTML='<span class="spin"></span>';
   const d=await (await fetch("/api/browse?"+p)).json();
+  if(mine!==TICKET) return;
 
   const subnav=cat.subs.map(s=>
     `<span class="sub ${state.sub===s.id?"on":""}" data-sub="${esc(s.id)}">${esc(s.label)} ${num(s.count)}</span>`).join("");
@@ -367,9 +380,10 @@ function hitCard(r){
 }
 
 async function run(){
+  const mine=++TICKET;
   if(!state.q.trim()){
-    if(state.cat) return renderCategory();
-    return renderDirectory();
+    if(state.cat) return renderCategory(mine);
+    return renderDirectory(mine);
   }
   if(false){
     return;
@@ -380,6 +394,7 @@ async function run(){
   let d;
   try{ d=await (await fetch("/api/search?"+qs({facets:1}),{signal:inflight.signal})).json(); }
   catch(e){ if(e.name==="AbortError") return; $("#meta").textContent="search failed"; return; }
+  if(mine!==TICKET) return;                       // the user has moved on
   render(d); syncURL();
 }
 
@@ -391,7 +406,9 @@ function render(d){
     `<span>${d.took_ms} ms</span>`+
     (active.length?`<span class="clear" id="clr">clear ${active.length} filter${active.length>1?"s":""}</span>`:"");
 
-  $("#results").innerHTML = d.results.length
+  const crumb='<div class="crumb"><a data-home="1">← Directory</a>'+
+    '<span class="sep">›</span><h2>Results</h2></div>';
+  $("#results").innerHTML = crumb + (d.results.length
     ? d.results.map(r=>{
         const tags=[`<span class="tag q">q${Math.round(r.quality)}</span>`,
           r.author_score!=null?`<span class="tag a">author ${Math.round(r.author_score)}</span>`:"",
@@ -409,7 +426,7 @@ function render(d){
           <div class="tags">${tags}</div></article>`;
       }).join("") + (d.count>=state.limit && d.count<d.total
         ? `<button class="more" id="more">Show more (${d.count} of ${d.total.toLocaleString()})</button>`:"")
-    : '<p class="empty">No skills matched. Try fewer words, or clear the filters.</p>';
+    : '<p class="empty">No skills matched. Try fewer words, or clear the filters.</p>');
 
   renderFacets(d.facets||{});
 }
@@ -510,7 +527,10 @@ document.addEventListener("click",e=>{
   if(sub){state.sub=sub.dataset.sub; state.offset=0; state.limit=20; run(); return;}
   const so=e.target.closest("[data-sort]");
   if(so){state.sort=so.dataset.sort; state.limit=20; run(); return;}
-  if(e.target.closest("[data-home]")){state.cat=""; state.sub=""; run(); return;}
+  if(e.target.closest("[data-home]")||e.target.closest("#home")){
+    state.q=""; state.cat=""; state.sub=""; state.offset=0; state.limit=20;
+    $("#q").value=""; run(); return;
+  }
   const hit=e.target.closest(".hit"); if(hit){openSkill(hit.dataset.id); return;}
   if(e.target.id==="scrim"||e.target.id==="closeBtn") closeDrawer();
 });
