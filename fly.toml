@@ -49,4 +49,10 @@ primary_region = 'lhr'
 
 [[vm]]
   size = 'shared-cpu-1x'
-  memory = '512mb'
+  # 1GB for a 0.64GB index, and the reason is the operating system's page
+  # cache rather than the process. Resident memory is only ~190MB, which is
+  # what 512MB was sized against — but SQLite's speed depends on the index
+  # file staying cached, and at 512MB it cannot. Measured on the live site:
+  # a query touching uncached pages took 1,042ms, the same query again 69ms.
+  # Enough memory to hold the whole index removes the first-touch penalty.
+  memory = '1024mb'
