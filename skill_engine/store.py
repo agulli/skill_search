@@ -154,6 +154,16 @@ CREATE TABLE IF NOT EXISTS vectors (
     vec       BLOB NOT NULL
 );
 
+-- Small key/value store for things computed once at release time and read on
+-- every request — the browsable catalogue above all. Recomputing it per page
+-- load meant a GROUP BY over every skill for an answer that only changes when
+-- the index is rebuilt.
+CREATE TABLE IF NOT EXISTS meta (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    computed_at REAL
+);
+
 CREATE TABLE IF NOT EXISTS crawl_log (
     id       INTEGER PRIMARY KEY,
     ts       REAL,
@@ -588,6 +598,23 @@ class Store:
             "queued": self.queue_depth(),
             "etags_cached": q("SELECT COUNT(*) c FROM etags").fetchone()["c"],
         }
+
+    def put_meta(self, key: str, value: str) -> None:
+        self.db.execute(
+            "INSERT INTO meta(key, value, computed_at) VALUES(?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+            "computed_at=excluded.computed_at",
+            (key, value, time.time()),
+        )
+        self.db.commit()
+
+    def get_meta(self, key: str) -> str | None:
+        try:
+            row = self.db.execute(
+                "SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        except sqlite3.OperationalError:
+            return None          # older database without the table
+        return row["value"] if row else None
 
     def log(self, kind: str, detail: str) -> None:
         self.db.execute(

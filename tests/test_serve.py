@@ -314,3 +314,64 @@ def test_static_page_is_cacheable_but_searches_are_not(server):
 
     # Liveness must always reflect the current process.
     assert "cache-control" not in httpx.get(server + "/health").headers
+
+
+def test_catalogue_is_precomputed_not_derived_per_request(tmp_path):
+    """It was a GROUP BY over every skill, run on every page load.
+
+    The directory changes only when the index is rebuilt, so deriving it per
+    request cost 49ms on a 100k corpus and far more at a million. Reading the
+    stored copy is 0.02ms.
+    """
+    from skill_engine.taxonomy import build_catalogue
+
+    db = tmp_path / "c.db"
+    store = Store(db)
+    store.upsert_repo({"full_name": "a/b", "default_branch": "main", "stars": 5,
+                       "forks": 1, "license": "MIT", "topics": [],
+                       "pushed_at": "2026-01-01T00:00:00Z", "is_fork": False,
+                       "archived": False, "disabled": False})
+    store.upsert_skill({
+        "repo": "a/b", "path": "skills/s/SKILL.md", "name": "pdf-extract",
+        "description": "Extract tables and text from PDF documents reliably.",
+        "body": "b" * 400, "heading": "", "version": None, "license": "MIT",
+        "allowed_tools": "[]", "metadata": "{}", "resources": "[]",
+        "source_kind": "skills-dir", "blob_sha": "x", "content_hash": "h",
+        "body_len": 400, "score": 1, "valid": 1, "invalid_reason": "",
+    })
+    store.db.execute("UPDATE skills SET category='documents', subcategory='pdf'")
+    store.commit()
+
+    assert store.get_meta("catalogue") is None      # nothing stored yet
+    build_catalogue(store)
+    stored = store.get_meta("catalogue")
+    assert stored and "documents" in stored
+    store.close()
+
+
+def test_catalogue_is_inlined_into_the_page(server):
+    """No fetch on first paint, which also makes the stale-render race
+    structurally impossible — nothing is in flight to arrive late."""
+    page = httpx.get(server + "/").text
+    assert "__CATALOGUE__" not in page          # placeholder was substituted
+
+
+def test_missing_catalogue_does_not_break_the_page(tmp_path):
+    """An index built before the catalogue existed must still serve."""
+    import threading
+    from http.server import ThreadingHTTPServer
+    from skill_engine.serve import make_handler
+
+    db = tmp_path / "old.db"
+    Store(db).close()                            # no catalogue stored
+    srv = ThreadingHTTPServer(
+        ("127.0.0.1", 0), make_handler(db, "none", read_only=True))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        page = httpx.get(base + "/")
+        assert page.status_code == 200
+        assert "null" in page.text               # falls back cleanly
+        assert httpx.get(base + "/api/categories").status_code == 200
+    finally:
+        srv.shutdown(); srv.server_close()

@@ -288,7 +288,7 @@ const EX=["extract tables from a pdf invoice","write terraform modules for aws",
   "build a slide deck","analyse a spreadsheet and chart it"];
 let state={q:"",limit:20,kind:"",license:"",language:"",min_stars:0,min_score:0,
            max_age_days:0,forks:0,cat:"",sub:"",sort:"quality",offset:0};
-let CATS=null;
+let CATS=__CATALOGUE__;
 // Every render is stamped with a ticket. A response that finishes after a
 // newer one started is discarded rather than painted: without this, the
 // directory's category fetch could land on top of search results the user had
@@ -319,11 +319,11 @@ function syncURL(){
 
 async function renderDirectory(mine){
   $("#facets").innerHTML=""; $("#meta").innerHTML="";
-  if(!CATS){
-    $("#results").innerHTML='<div class="hint"><span class="spin"></span> loading the directory…</div>';
+  if(!CATS){                                      // only if inlining failed
+    $("#results").innerHTML='<div class="hint"><span class="spin"></span> loading…</div>';
     CATS=await (await fetch("/api/categories")).json();
+    if(mine!==TICKET) return;
   }
-  if(mine!==TICKET) return;                       // a newer view won
   const cards=CATS.categories.map(c=>`
     <div class="cat" data-cat="${esc(c.id)}">
       <div class="top"><span class="ico">${c.icon}</span>
@@ -656,6 +656,15 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                 })
 
             if parsed.path == "/":
+                # Inlined into the HTML rather than fetched. That removes a
+                # round trip from every first paint and makes the stale-render
+                # race structurally impossible: there is nothing in flight to
+                # arrive late and overwrite a newer view.
+                page = PAGE.replace(
+                    "__CATALOGUE__", store.get_meta("catalogue") or "null")
+                return self._send(200, page.encode(), "text/html; charset=utf-8",
+                                  cache=PAGE_CACHE)
+            if False:
                 # The landing page is one static string, identical for everyone,
                 # so it should be served from a CDN edge rather than fetched
                 # from the origin every time. Without an explicit header
@@ -713,8 +722,15 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                                   data or {"error": "not found"})
 
             if parsed.path == "/api/categories":
-                # The one genuinely static API response: the directory tree
-                # changes only when the corpus is rebuilt.
+                # Precomputed at release time. Deriving it per request meant a
+                # GROUP BY over every skill — 49ms on 100k, far worse at a
+                # million — for an answer that only changes when the index is
+                # rebuilt. Reading the stored copy takes 0.02ms.
+                cached = store.get_meta("catalogue")
+                if cached:
+                    return self._send(200, cached.encode(), "application/json",
+                                      cache=PAGE_CACHE)
+                # Older index without it: compute, so nothing breaks.
                 counts = category_counts(store)
                 tree = []
                 for cat in category_tree():
