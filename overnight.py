@@ -72,7 +72,14 @@ async def phase_sweep(store, cfg, target: int) -> int:
         target_skills=target,
         concurrency=CONCURRENCY,
         max_mb=MAX_MB,
-        batch=24,
+        # Batch must be much larger than concurrency. With both at 24 the
+        # sweep runs one batch at a time and waits for its slowest member,
+        # so one large tarball stalls 23 finished downloads — measured at
+        # 0.6 repos/s against a pacing floor that permits 6.7. A wide batch
+        # keeps the semaphore saturated: as each fetch finishes the next
+        # starts, so stragglers overlap with useful work instead of
+        # blocking it.
+        batch=int(os.getenv("SKILL_ENGINE_SWEEP_BATCH", "400")),
         rerank_every=int(os.getenv('SKILL_ENGINE_RERANK_EVERY', '2000')),
         on_progress=progress,
     )

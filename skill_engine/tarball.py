@@ -236,6 +236,15 @@ async def run_tarball_crawl(
     # sets the ceiling on throughput: 0.15s allows at most 6.7 repos/second no
     # matter how many are in flight. Tunable because the right value depends on
     # how the endpoint is behaving — watch the failure rate, not the clock.
+    # Sharding lets several sweep processes run without fighting over the same
+    # rows. Throughput plateaued near 9k repos/h at 30% CPU, 14Mbps and zero
+    # failures — nothing local was saturated, which points upstream. Disjoint
+    # slices are how to test that: if N processes give roughly N times the
+    # rate the limit was per-connection; if not, it is per-IP and this costs
+    # nothing.
+    shard = int(os.getenv("SKILL_ENGINE_SHARD", "0"))
+    shards = max(1, int(os.getenv("SKILL_ENGINE_SHARDS", "1")))
+
     fetcher = TarballFetcher(
         concurrency=concurrency,
         max_bytes=max_mb * 1024 * 1024,
@@ -257,10 +266,11 @@ async def run_tarball_crawl(
                   AND r.tree_sha IS NULL
                   AND COALESCE(r.size_kb, 0) <= ?
                   AND r.disabled = 0
+                  AND (? = 1 OR q.rowid % ? = ?)
                 ORDER BY r.repo_score DESC, q.priority DESC
                 LIMIT ?
                 """,
-                (max_mb * 1024, batch),
+                (max_mb * 1024, shards, shards, shard, batch),
             ).fetchall()
             if not rows:
                 log.info("queue drained for the tarball path")

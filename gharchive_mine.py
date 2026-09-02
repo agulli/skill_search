@@ -13,7 +13,7 @@ it — but confirming is exactly what the tarball path already does for free.
 
     python gharchive_mine.py data/scale.db 48      # mine the last 48 hours
 """
-import asyncio, gzip, io, json, logging, sys, time
+import asyncio, gzip, io, json, logging, os, sys, time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,7 +25,12 @@ from skill_engine.store import Store
 
 DB = sys.argv[1] if len(sys.argv) > 1 else "data/scale.db"
 HOURS = int(sys.argv[2]) if len(sys.argv) > 2 else 48
-CONCURRENCY = 3
+# Hours to skip before starting, so the history can be sharded across several
+# processes that do not re-download each other's files. The job is bandwidth-
+# and CPU-bound per process, so N shards over disjoint windows is close to N
+# times the throughput — the only way a 90-day sweep finishes in one night.
+SKIP = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+CONCURRENCY = int(os.getenv("GHARCHIVE_CONCURRENCY", "3"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s A %(message)s",
                     datefmt="%H:%M:%S")
@@ -80,7 +85,8 @@ async def mine_hour(client, ts, seen, lock, stats):
 async def main():
     store = Store(Path(DB))
     seen = {r["full_name"] for r in store.db.execute("SELECT full_name FROM repos")}
-    log.info("mining %d hours; %d repos already known", HOURS, len(seen))
+    log.info("mining %d hours from -%dh; %d repos already known",
+             HOURS, SKIP, len(seen))
 
     lock = asyncio.Lock()
     stats = {"events": 0, "bytes": 0}
@@ -95,8 +101,9 @@ async def main():
                 return await mine_hour(client, now - timedelta(hours=offset),
                                        seen, lock, stats)
 
-        for chunk_start in range(0, HOURS, CONCURRENCY * 2):
-            offsets = range(chunk_start, min(chunk_start + CONCURRENCY * 2, HOURS))
+        for chunk_start in range(SKIP, SKIP + HOURS, CONCURRENCY * 2):
+            offsets = range(chunk_start,
+                            min(chunk_start + CONCURRENCY * 2, SKIP + HOURS))
             for names in await asyncio.gather(*(one(o) for o in offsets)):
                 for name in names:
                     # Low priority: these are name-matched guesses, so they
