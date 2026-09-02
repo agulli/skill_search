@@ -242,6 +242,15 @@ async def run_tarball_crawl(
     # slices are how to test that: if N processes give roughly N times the
     # rate the limit was per-connection; if not, it is per-IP and this costs
     # nothing.
+    # A size *floor*, so a sweep can be aimed at large repositories alone.
+    # Measured on what is already crawled: repos of 10-50MB average 40.1
+    # skills against 5.9 for those under 10MB, and are productive 79.7% of
+    # the time against 60.8%. The default 10MB ceiling was excluding 36,516
+    # uncrawled repositories in that band — on those averages, upwards of a
+    # million skills. Whether they are worth the bandwidth is an empirical
+    # question: if the upstream limit is on requests, big repos are a far
+    # better use of each one; if it is on bytes, they are a worse one.
+    min_kb = int(os.getenv("SKILL_ENGINE_MIN_SIZE_KB", "0"))
     shard = int(os.getenv("SKILL_ENGINE_SHARD", "0"))
     shards = max(1, int(os.getenv("SKILL_ENGINE_SHARDS", "1")))
 
@@ -265,12 +274,13 @@ async def run_tarball_crawl(
                 WHERE q.attempts < 4
                   AND r.tree_sha IS NULL
                   AND COALESCE(r.size_kb, 0) <= ?
+                  AND COALESCE(r.size_kb, 0) >= ?
                   AND r.disabled = 0
                   AND (? = 1 OR q.rowid % ? = ?)
                 ORDER BY r.repo_score DESC, q.priority DESC
                 LIMIT ?
                 """,
-                (max_mb * 1024, shards, shards, shard, batch),
+                (max_mb * 1024, min_kb, shards, shards, shard, batch),
             ).fetchall()
             if not rows:
                 log.info("queue drained for the tarball path")
