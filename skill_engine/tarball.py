@@ -61,18 +61,60 @@ class TarballFetcher:
             headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip"},
             limits=httpx.Limits(max_connections=concurrency * 2),
         )
-        self.stats = {"downloads": 0, "bytes": 0, "too_big": 0, "failed": 0}
+        self.stats = {"downloads": 0, "bytes": 0, "too_big": 0, "failed": 0,
+                      "throttled": 0}
+        # Adaptive pacing (AIMD). codeload publishes no quota header, so the
+        # only signal that we are going too fast is a 429 — and the response to
+        # one must be global. Sleeping inside the single task that was refused,
+        # as this did before, leaves the other N-1 workers hammering at the
+        # unchanged rate: the refusals continue, the pause repeats, and
+        # throughput sawtooths instead of settling. A shared delay that
+        # multiplies on refusal and decays on success converges on whatever
+        # rate the endpoint will actually sustain, without having to guess it.
+        self.base_delay = self.min_delay
+        self.max_delay = float(os.getenv("SKILL_ENGINE_MAX_DELAY", "2.0"))
+        self.recover_step = float(os.getenv("SKILL_ENGINE_RECOVER_STEP", "0.001"))
+        self._pause_until = 0.0
 
     async def aclose(self) -> None:
         await self.client.aclose()
 
     async def _pace(self) -> None:
-        """Keep a floor between request starts, regardless of concurrency."""
+        """Keep a floor between request starts, regardless of concurrency.
+
+        Also honours a global pause, so a refusal stops *every* worker rather
+        than only the one that received it.
+        """
         async with self._lock:
+            now = time.monotonic()
+            if now < self._pause_until:
+                await asyncio.sleep(self._pause_until - now)
             gap = time.monotonic() - self._last
             if gap < self.min_delay:
                 await asyncio.sleep(self.min_delay - gap)
             self._last = time.monotonic()
+
+    def _slow_down(self) -> None:
+        """Multiplicative decrease, plus a short pause for every worker."""
+        self.stats["throttled"] += 1
+        self.min_delay = min(self.max_delay, max(self.min_delay, 0.05) * 2.0)
+        self._pause_until = time.monotonic() + 15.0
+        log.warning("codeload refused; pacing now %.2fs between starts",
+                    self.min_delay)
+
+    def _speed_up(self) -> None:
+        """Additive decrease of the delay, so a quiet endpoint is used fully.
+
+        The step is deliberately far smaller than the doubling that a refusal
+        applies. At 0.01 the delay recovered a doubling in about eight seconds,
+        which simply earned another refusal — four in ten minutes, oscillating
+        between the safe rate and the one that gets rejected. Recovery should
+        take minutes, so the crawler spends most of its time just under the
+        limit rather than repeatedly rediscovering where it is.
+        """
+        if self.min_delay > self.base_delay:
+            self.min_delay = max(self.base_delay,
+                                 self.min_delay - self.recover_step)
 
     async def fetch(self, owner: str, repo: str, ref: str) -> bytes | None:
         """Download an archive, aborting early if it exceeds the size cap."""
@@ -83,11 +125,8 @@ class TarballFetcher:
                 async with self.client.stream("GET", url) as resp:
                     if resp.status_code != 200:
                         if resp.status_code in (403, 429):
-                            # Back off hard: this endpoint has no quota header
-                            # to consult, so the only safe response is patience.
-                            log.warning("codeload %s on %s/%s; pausing",
-                                        resp.status_code, owner, repo)
-                            await asyncio.sleep(30)
+                            # Slows every worker, not just this one.
+                            self._slow_down()
                         self.stats["failed"] += 1
                         return None
 
@@ -111,6 +150,10 @@ class TarballFetcher:
 
         self.stats["downloads"] += 1
         self.stats["bytes"] += len(buf)
+        # Additive increase: each success walks the delay back toward the
+        # configured floor, so a temporary refusal does not permanently cap
+        # throughput once the endpoint is willing again.
+        self._speed_up()
         return bytes(buf)
 
 
@@ -332,10 +375,19 @@ async def run_tarball_crawl(
                     log.warning("rerank failed (continuing): %s", exc)
     finally:
         await fetcher.aclose()
-        try:
-            recompute(store)
-        except Exception as exc:
-            log.warning("final rerank failed: %s", exc)
+        # Honour the same switch as the periodic rerank. On a 2.4M-skill corpus
+        # this final pass cost 3.5 hours — corpus stats over 1.43M repos, then
+        # profiling 212,343 authors, then scoring everything — during which the
+        # crawler harvested nothing at all. It is pure waste while still
+        # crawling: `release.py` ranks once from the finished corpus anyway, and
+        # a mid-crawl ordering only decides which repos are swept next.
+        if rerank_every < 1_000_000:
+            try:
+                recompute(store)
+            except Exception as exc:
+                log.warning("final rerank failed: %s", exc)
+        else:
+            log.info("skipping final rerank (disabled); release.py will rank")
 
     totals["download_stats"] = fetcher.stats
     return totals

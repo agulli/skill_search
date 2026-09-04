@@ -192,6 +192,12 @@ INDEXES = (
 )
 
 
+# Characters of skill body retained by the crawler. 0 disables the cap.
+# Release builds trim to 2,000; keeping a little more here leaves room to
+# change that decision without recrawling.
+CRAWL_BODY_CAP = int(os.getenv("SKILL_ENGINE_CRAWL_BODY_CAP", "4000"))
+
+
 class Store:
     def __init__(self, path: Path | str, *, read_only: bool = False) -> None:
         """Open the corpus. `read_only` is for serving.
@@ -518,6 +524,19 @@ class Store:
     # --------------------------------------------------------------- skills
 
     def upsert_skill(self, rec: dict) -> None:
+        # Store at most CRAWL_BODY_CAP characters of body. At 2.47M skills the
+        # crawl database reached 70.8GB — 28KB per skill, nearly all of it body
+        # text — which made reaching 5M possible but building a release from it
+        # impossible: that needs a snapshot plus a compacted copy, about 258GB.
+        #
+        # Nothing is lost that the shipped index keeps: release.py already
+        # truncates to 2,000 characters, and doing so measured *better* on every
+        # retrieval metric, because truncation removes spurious matches deep in
+        # long documents. `content_hash` and `body_len` arrive already computed
+        # from the full text, so deduplication and the recorded true length are
+        # both unaffected.
+        if CRAWL_BODY_CAP and rec.get("body") and len(rec["body"]) > CRAWL_BODY_CAP:
+            rec = {**rec, "body": rec["body"][:CRAWL_BODY_CAP]}
         self.db.execute(
             """
             INSERT INTO skills(repo, path, name, description, body, heading, version,
