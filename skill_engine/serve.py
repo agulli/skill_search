@@ -66,6 +66,87 @@ def request_cost(path: str, params: dict) -> float:
     return cost
 
 
+# Google AdSense. Everything here stays inert until a publisher ID is set, so
+# the site is unchanged until there is an account to attach it to. The ID looks
+# like "pub-1234567890123456".
+ADSENSE_ID = os.getenv("SKILL_ENGINE_ADSENSE_ID", "").strip()
+# Sellers authorised to sell this site's inventory. Google requires this file at
+# the domain root; without it the inventory is treated as unauthorised and most
+# demand disappears.
+ADS_TXT = (f"google.com, {ADSENSE_ID}, DIRECT, f08c47fec0942fa0\n"
+           if ADSENSE_ID else "")
+
+CONTACT_EMAIL = os.getenv("SKILL_ENGINE_CONTACT", "hello@searchskills.ai")
+
+PRIVACY = """<!doctype html><meta charset="utf-8">
+<title>Privacy — Agent Skills Search</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+ :root{--fg:#111;--bg:#fff;--mut:#666;--line:#e5e5e5}
+ @media (prefers-color-scheme:dark){:root:not([data-theme=light]){
+   --fg:#e8e8e8;--bg:#131313;--mut:#999;--line:#2a2a2a}}
+ body{background:var(--bg);color:var(--fg);font:15px/1.65 -apple-system,
+   BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;
+   max-width:44rem;margin:0 auto;padding:3rem 1.25rem 5rem}
+ h1{font-size:1.5rem;margin:0 0 .25rem} h2{font-size:1.05rem;margin:2rem 0 .5rem}
+ a{color:inherit} .mut{color:var(--mut)}
+ hr{border:0;border-top:1px solid var(--line);margin:2rem 0}
+</style>
+<p class=mut><a href="/">&larr; Agent Skills Search</a></p>
+<h1>Privacy</h1>
+<p class=mut>What this site collects, and what it does not.</p>
+<hr>
+<h2>What we store about you</h2>
+<p>No accounts, no profiles, no tracking cookies of our own. Searches are not
+tied to an identity. Server logs record a salted, truncated hash of the
+connecting address rather than the address itself — enough to tell one client
+making thousands of requests from thousands of clients making one, which is how
+abuse is detected, and not enough to identify anyone.</p>
+<h2>What the site shows</h2>
+<p>Every skill indexed here comes from a public GitHub repository, along with
+its author and repository metadata. Nothing private is collected or shown. If
+you own a repository and want it removed from the index, email
+<a href="mailto:__CONTACT__">__CONTACT__</a> and it will be dropped.</p>
+<h2>Advertising</h2>
+<p>__ADS_PARA__</p>
+<h2>Third parties</h2>
+<p>The site is served through Cloudflare, which processes requests and may set
+a cookie for security purposes. Their handling is covered by Cloudflare's own
+privacy policy.</p>
+<hr>
+<p class=mut>Questions: <a href="mailto:__CONTACT__">__CONTACT__</a></p>
+"""
+
+ADS_PARA_ON = (
+    "This site shows ads served by Google. Google and its partners may use "
+    "cookies or device identifiers to serve and measure ads, including "
+    "personalised ads where you have consented. You can review and change your "
+    "choices at any time through the consent prompt, and manage Google's own "
+    "ad settings at <a href='https://myadcenter.google.com'>My Ad Center</a>. "
+    "For how Google uses data from sites that use its services, see "
+    "<a href='https://policies.google.com/technologies/partner-sites'>"
+    "policies.google.com/technologies/partner-sites</a>.")
+# The loader goes in <head> so the tag is present before slots render, and is
+# marked async so a slow ad server never blocks the search UI — the page must
+# stay usable if the request is blocked, which for an ad script is common.
+ADS_HEAD = ("""<script async crossorigin="anonymous"
+ src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-__ID__"></script>""")
+
+# A single slot below the results rather than beside them. Ads interleaved with
+# search results read as results, which is both against Google's policy on
+# distinguishing ads from content and the fastest way to lose trust in a
+# ranking people are meant to rely on.
+ADS_SLOT = ("""<div style="max-width:56rem;margin:0 auto 3rem;padding:0 1.25rem">
+<ins class="adsbygoogle" style="display:block" data-ad-client="ca-__ID__"
+ data-ad-slot="__SLOT__" data-ad-format="auto" data-full-width-responsive="true"></ins>
+<script>(adsbygoogle=window.adsbygoogle||[]).push({});</script></div>""")
+
+ADSENSE_SLOT_ID = os.getenv("SKILL_ENGINE_ADSENSE_SLOT", "").strip()
+
+
+ADS_PARA_OFF = "This site currently shows no advertising and sets no ad cookies."
+
+
 ROBOTS = """User-agent: *
 Allow: /$
 Allow: /api/categories
@@ -335,7 +416,7 @@ select,input[type=number]{width:100%;padding:6px 8px;border:1px solid var(--line
 .spin{display:inline-block;width:11px;height:11px;border:2px solid var(--line);
   border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite}
 @keyframes sp{to{transform:rotate(360deg)}}
-</style></head><body>
+</style>__ADS_HEAD__</head><body>
 <header><div class="bar">
   <div class="brand" id="home" title="Back to the directory">Agent Skills Search by AGI <span id="corpus"></span></div>
   <div class="searchwrap">
@@ -627,7 +708,15 @@ document.addEventListener("keydown",e=>{
   }
   run(); $("#q").focus();
 })();
-</script></body></html>"""
+</script>
+<footer style="max-width:56rem;margin:3rem auto 2rem;padding:1.25rem;
+  border-top:1px solid var(--line,#e5e5e5);font-size:12px;opacity:.7;
+  display:flex;gap:1rem;flex-wrap:wrap">
+  <a href="/privacy" style="color:inherit">Privacy</a>
+  <span>Skills indexed from public GitHub repositories.</span>
+</footer>
+__ADS_SLOT__
+</body></html>"""
 
 
 def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
@@ -682,6 +771,23 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
             # Liveness must answer even when the limiter is angry, or a health
             # check failing under load would take the machine out exactly when
             # it is busiest.
+            if parsed.path == "/ads.txt":
+                # Served only when configured. An empty or placeholder ads.txt
+                # is worse than none: Google reads it as "nobody may sell this
+                # inventory" and demand collapses.
+                if not ADS_TXT:
+                    return self._send(404, b"", "text/plain")
+                return self._send(200, ADS_TXT.encode(), "text/plain",
+                                  cache=PAGE_CACHE)
+
+            if parsed.path == "/privacy":
+                body = (PRIVACY
+                        .replace("__CONTACT__", CONTACT_EMAIL)
+                        .replace("__ADS_PARA__",
+                                 ADS_PARA_ON if ADSENSE_ID else ADS_PARA_OFF))
+                return self._send(200, body.encode(),
+                                  "text/html; charset=utf-8", cache=PAGE_CACHE)
+
             if parsed.path == "/robots.txt":
                 # Honest crawlers are told to leave the API alone. It stops
                 # well-behaved bots indexing 100k result pages; it does nothing
@@ -754,6 +860,16 @@ def make_handler(db_path, embedder_name: str, *, read_only: bool = False,
                 # arrive late and overwrite a newer view.
                 page = PAGE.replace(
                     "__CATALOGUE__", store.get_meta("catalogue") or "null")
+                # Both replaced with nothing unless a publisher ID is set, so
+                # the served page is byte-identical to today's until then.
+                page = page.replace(
+                    "__ADS_HEAD__",
+                    ADS_HEAD.replace("__ID__", ADSENSE_ID) if ADSENSE_ID else "")
+                page = page.replace(
+                    "__ADS_SLOT__",
+                    ADS_SLOT.replace("__ID__", ADSENSE_ID)
+                            .replace("__SLOT__", ADSENSE_SLOT_ID)
+                    if ADSENSE_ID and ADSENSE_SLOT_ID else "")
                 return self._send(200, page.encode(), "text/html; charset=utf-8",
                                   cache=PAGE_CACHE)
             if False:

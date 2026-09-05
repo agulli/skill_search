@@ -455,3 +455,60 @@ def test_limiter_never_raises_when_refill_is_zero():
     assert lim.allow("x", 1.0)[0]
     ok, wait = lim.allow("x", 1.0)      # must not raise
     assert not ok and wait > 0
+
+
+# ------------------------------------------------------------------ ads
+
+
+def test_no_ad_markup_leaks_when_unconfigured(monkeypatch):
+    """Without a publisher ID the page must carry no ad markup at all.
+
+    Not merely "no ads shown": a leftover placeholder or an empty <ins> would
+    both be visible in the source and, in AdSense's case, is the sort of thing
+    that gets a site rejected on review.
+    """
+    import importlib
+    import skill_engine.serve as serve
+    monkeypatch.delenv("SKILL_ENGINE_ADSENSE_ID", raising=False)
+    importlib.reload(serve)
+    assert serve.ADSENSE_ID == ""
+    assert serve.ADS_TXT == ""
+    page = serve.PAGE.replace("__CATALOGUE__", "null") \
+                     .replace("__ADS_HEAD__", "").replace("__ADS_SLOT__", "")
+    assert "adsbygoogle" not in page
+    assert "__ADS" not in page
+    assert "googlesyndication" not in page
+
+
+def test_ads_txt_is_404_until_configured(monkeypatch):
+    """An empty ads.txt is worse than none — Google reads it as 'nobody may
+    sell this inventory' and demand collapses. It must 404, not return ''."""
+    import importlib
+    import skill_engine.serve as serve
+    monkeypatch.delenv("SKILL_ENGINE_ADSENSE_ID", raising=False)
+    importlib.reload(serve)
+    assert serve.ADS_TXT == ""
+
+
+def test_ads_txt_names_google_when_configured(monkeypatch):
+    import importlib
+    import skill_engine.serve as serve
+    monkeypatch.setenv("SKILL_ENGINE_ADSENSE_ID", "pub-0000000000000000")
+    importlib.reload(serve)
+    assert serve.ADS_TXT.startswith("google.com, pub-0000000000000000, DIRECT")
+    assert "f08c47fec0942fa0" in serve.ADS_TXT   # Google's fixed TAG id
+    monkeypatch.delenv("SKILL_ENGINE_ADSENSE_ID", raising=False)
+    importlib.reload(serve)
+
+
+def test_privacy_page_states_whether_ads_run(monkeypatch):
+    """The privacy text must match reality in both states, not claim ads that
+    do not run or stay silent about ads that do."""
+    import importlib
+    import skill_engine.serve as serve
+    monkeypatch.delenv("SKILL_ENGINE_ADSENSE_ID", raising=False)
+    importlib.reload(serve)
+    off = serve.PRIVACY.replace("__ADS_PARA__", serve.ADS_PARA_OFF)
+    assert "no advertising" in off
+    on = serve.PRIVACY.replace("__ADS_PARA__", serve.ADS_PARA_ON)
+    assert "Google" in on and "consent" in on
