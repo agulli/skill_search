@@ -61,3 +61,33 @@ def test_adaptive_backoff_slows_globally_and_recovers():
         f._speed_up()
     assert f.min_delay == f.base_delay        # recovers to the floor, not below
     assert slowed > f.base_delay
+
+
+def test_forbidden_breaker_trips_only_on_repeated_403s():
+    """One 403 is a repository; a run of them is us. Only the latter stops."""
+    from skill_engine.tarball import TarballFetcher
+
+    f = TarballFetcher(concurrency=2, max_bytes=1 << 20, min_delay=0.05)
+    assert f.blocked is False
+
+    for _ in range(f.forbidden_limit - 1):
+        f._forbidden()
+    assert f.blocked is False, "a few 403s must not halt a multi-day crawl"
+
+    f._forbidden()
+    assert f.blocked is True
+    assert f.stats["forbidden"] == f.forbidden_limit
+
+
+def test_429_and_403_are_handled_differently():
+    """Backing off clears a throttle; it does not clear a block."""
+    from skill_engine.tarball import TarballFetcher
+
+    f = TarballFetcher(concurrency=2, max_bytes=1 << 20, min_delay=0.05)
+    f._slow_down()
+    assert f.min_delay > 0.05 and f.blocked is False   # 429: slow, keep going
+
+    g = TarballFetcher(concurrency=2, max_bytes=1 << 20, min_delay=0.05)
+    for _ in range(g.forbidden_limit):
+        g._forbidden()
+    assert g.blocked is True                            # 403: stop

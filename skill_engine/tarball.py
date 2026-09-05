@@ -62,7 +62,7 @@ class TarballFetcher:
             limits=httpx.Limits(max_connections=concurrency * 2),
         )
         self.stats = {"downloads": 0, "bytes": 0, "too_big": 0, "failed": 0,
-                      "throttled": 0}
+                      "throttled": 0, "forbidden": 0}
         # Adaptive pacing (AIMD). codeload publishes no quota header, so the
         # only signal that we are going too fast is a 429 — and the response to
         # one must be global. Sleeping inside the single task that was refused,
@@ -75,6 +75,9 @@ class TarballFetcher:
         self.max_delay = float(os.getenv("SKILL_ENGINE_MAX_DELAY", "2.0"))
         self.recover_step = float(os.getenv("SKILL_ENGINE_RECOVER_STEP", "0.001"))
         self._pause_until = 0.0
+        self.blocked = False
+        self._forbidden_times: list[float] = []
+        self.forbidden_limit = int(os.getenv("SKILL_ENGINE_FORBIDDEN_LIMIT", "5"))
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -102,6 +105,27 @@ class TarballFetcher:
         log.warning("codeload refused; pacing now %.2fs between starts",
                     self.min_delay)
 
+    def _forbidden(self) -> None:
+        """Record a 403 and trip the breaker once they are clearly not noise.
+
+        A handful can be per-repository (DMCA takedowns, disabled repos), so a
+        single one must not halt a multi-day crawl. A run of them in quick
+        succession is the endpoint refusing *us*, and continuing past that is
+        how a throttle becomes a ban.
+        """
+        now = time.monotonic()
+        self.stats["forbidden"] += 1
+        self._forbidden_times.append(now)
+        window = [t for t in self._forbidden_times if now - t < 600]
+        self._forbidden_times = window
+        if len(window) >= self.forbidden_limit:
+            self.blocked = True
+            log.error("codeload returned %d 403s in 10 minutes — stopping "
+                      "rather than pushing into a ban", len(window))
+        else:
+            log.warning("codeload 403 (%d in the last 10 min)", len(window))
+        self._pause_until = now + 60.0
+
     def _speed_up(self) -> None:
         """Additive decrease of the delay, so a quiet endpoint is used fully.
 
@@ -124,9 +148,15 @@ class TarballFetcher:
             try:
                 async with self.client.stream("GET", url) as resp:
                     if resp.status_code != 200:
-                        if resp.status_code in (403, 429):
-                            # Slows every worker, not just this one.
+                        if resp.status_code == 429:
+                            # "Slow down." Slows every worker, not just this one.
                             self._slow_down()
+                        elif resp.status_code == 403:
+                            # "You are blocked." A different thing entirely, and
+                            # previously indistinguishable in the logs because
+                            # both were handled here together. Backing off does
+                            # not clear a 403; only stopping does.
+                            self._forbidden()
                         self.stats["failed"] += 1
                         return None
 
@@ -327,6 +357,15 @@ async def run_tarball_crawl(
             ).fetchall()
             if not rows:
                 log.info("queue drained for the tarball path")
+                break
+
+            if fetcher.blocked:
+                # The breaker has tripped. Stop the sweep outright rather than
+                # working through the batch: every further request while
+                # forbidden makes a temporary block more likely to become a
+                # permanent one. The queue is the checkpoint, so nothing is
+                # lost and a later run resumes here.
+                log.error("stopping sweep: codeload is refusing us outright")
                 break
 
             store.db.executemany(
