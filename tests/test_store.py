@@ -91,3 +91,58 @@ def test_429_and_403_are_handled_differently():
     for _ in range(g.forbidden_limit):
         g._forbidden()
     assert g.blocked is True                            # 403: stop
+
+
+def test_retry_after_is_honoured_when_the_server_sends_one():
+    """If the server states how long to wait, guessing is worse behaved."""
+    import time
+    from skill_engine.tarball import TarballFetcher
+
+    f = TarballFetcher(concurrency=2, max_bytes=1 << 20, min_delay=0.05)
+    before = time.monotonic()
+    f._slow_down(retry_after="120")
+    assert f._pause_until - before >= 119
+    assert f.stats["retry_after_honoured"] == 1
+
+
+def test_retry_after_garbage_does_not_crash_the_crawler():
+    """A bad header must fall back, not take down a multi-day run."""
+    from skill_engine.tarball import TarballFetcher
+
+    for bad in ("Wed, 21 Oct 2026 07:28:00 GMT", "", "soon", None, "-5"):
+        f = TarballFetcher(concurrency=2, max_bytes=1 << 20, min_delay=0.05)
+        f._slow_down(retry_after=bad)          # must not raise
+        assert f._pause_until > 0
+
+
+def test_retry_after_is_bounded():
+    """A hostile or mistaken header must not park the crawler for a day."""
+    from skill_engine.tarball import TarballFetcher
+
+    f = TarballFetcher(concurrency=2, max_bytes=1 << 20, min_delay=0.05)
+    import time
+    before = time.monotonic()
+    f._slow_down(retry_after="999999")
+    assert f._pause_until - before <= 301
+
+
+def test_recovery_only_accelerates_after_a_sustained_clean_run():
+    """The first success after a refusal is evidence of nothing."""
+    import time
+    from skill_engine.tarball import TarballFetcher
+
+    f = TarballFetcher(concurrency=2, max_bytes=1 << 20, min_delay=0.05)
+    f._slow_down()
+    slowed = f.min_delay
+
+    f._clean_since = time.monotonic()          # just recovered: no acceleration
+    f._speed_up()
+    fresh_step = slowed - f.min_delay
+
+    f.min_delay = slowed
+    f._clean_since = time.monotonic() - 3600   # an hour clean: faster taper
+    f._speed_up()
+    quiet_step = slowed - f.min_delay
+
+    assert quiet_step > fresh_step
+    assert quiet_step <= fresh_step * 4 + 1e-9, "taper, not a probe"

@@ -62,7 +62,8 @@ class TarballFetcher:
             limits=httpx.Limits(max_connections=concurrency * 2),
         )
         self.stats = {"downloads": 0, "bytes": 0, "too_big": 0, "failed": 0,
-                      "throttled": 0, "forbidden": 0}
+                      "throttled": 0, "forbidden": 0,
+                      "retry_after_honoured": 0}
         # Adaptive pacing (AIMD). codeload publishes no quota header, so the
         # only signal that we are going too fast is a 429 — and the response to
         # one must be global. Sleeping inside the single task that was refused,
@@ -77,6 +78,7 @@ class TarballFetcher:
         self._pause_until = 0.0
         self.blocked = False
         self._forbidden_times: list[float] = []
+        self._clean_since: float | None = None
         self.forbidden_limit = int(os.getenv("SKILL_ENGINE_FORBIDDEN_LIMIT", "5"))
 
     async def aclose(self) -> None:
@@ -97,13 +99,32 @@ class TarballFetcher:
                 await asyncio.sleep(self.min_delay - gap)
             self._last = time.monotonic()
 
-    def _slow_down(self) -> None:
-        """Multiplicative decrease, plus a short pause for every worker."""
+    def _slow_down(self, retry_after: str | None = None) -> None:
+        """Multiplicative decrease, plus a pause for every worker.
+
+        Honours `Retry-After` when the server sends one. Guessing a pause
+        length when the server has stated it is both worse behaved and worse
+        engineering: too short and we walk straight back into the refusal, too
+        long and we idle for no reason. The header is the answer to exactly the
+        question the fixed 15s was guessing at.
+        """
         self.stats["throttled"] += 1
         self.min_delay = min(self.max_delay, max(self.min_delay, 0.05) * 2.0)
-        self._pause_until = time.monotonic() + 15.0
-        log.warning("codeload refused; pacing now %.2fs between starts",
-                    self.min_delay)
+
+        wait = 15.0
+        if retry_after:
+            try:
+                # Seconds form. An HTTP-date is also legal but codeload does not
+                # send one, and a bad parse must not take the crawler down.
+                wait = max(1.0, min(300.0, float(retry_after.strip())))
+                self.stats["retry_after_honoured"] += 1
+            except (TypeError, ValueError):
+                pass
+        self._clean_since = None
+        self._pause_until = time.monotonic() + wait
+        log.warning("codeload refused; pacing now %.2fs, waiting %.0fs%s",
+                    self.min_delay, wait,
+                    " (Retry-After)" if retry_after else "")
 
     def _forbidden(self) -> None:
         """Record a 403 and trip the breaker once they are clearly not noise.
@@ -136,9 +157,22 @@ class TarballFetcher:
         take minutes, so the crawler spends most of its time just under the
         limit rather than repeatedly rediscovering where it is.
         """
-        if self.min_delay > self.base_delay:
-            self.min_delay = max(self.base_delay,
-                                 self.min_delay - self.recover_step)
+        if self.min_delay <= self.base_delay:
+            self._clean_since = self._clean_since or time.monotonic()
+            return
+        now = time.monotonic()
+        if self._clean_since is None:
+            self._clean_since = now
+        # Recovery accelerates only after a sustained clean run. A long quiet
+        # period is evidence the limit has genuinely lifted, whereas the first
+        # success after a refusal is evidence of nothing — which is why a flat
+        # step either crawls back too slowly for hours or walks straight into
+        # the next refusal. Capped at 4x so this stays a gentle taper, not a
+        # probe for the boundary.
+        quiet = now - self._clean_since
+        factor = 1.0 if quiet < 600 else (2.0 if quiet < 1800 else 4.0)
+        self.min_delay = max(self.base_delay,
+                             self.min_delay - self.recover_step * factor)
 
     async def fetch(self, owner: str, repo: str, ref: str) -> bytes | None:
         """Download an archive, aborting early if it exceeds the size cap."""
@@ -150,7 +184,7 @@ class TarballFetcher:
                     if resp.status_code != 200:
                         if resp.status_code == 429:
                             # "Slow down." Slows every worker, not just this one.
-                            self._slow_down()
+                            self._slow_down(resp.headers.get("Retry-After"))
                         elif resp.status_code == 403:
                             # "You are blocked." A different thing entirely, and
                             # previously indistinguishable in the logs because
