@@ -455,3 +455,51 @@ def test_quantity_alone_does_not_buy_a_high_author_score(store):
     recompute(store)
     assert (get_author(store, "careful")["author_score"]
             > get_author(store, "prolific")["author_score"])
+
+
+# ------------------------------------------------- adoption vs sprawl
+
+
+def _distinct_family(dup_count, owner_count):
+    """The distinctness family in isolation, as score_skill computes it."""
+    import math
+    from skill_engine.ranking import blend
+    owners = max(int(owner_count or 1), 1)
+    cpo = max(dup_count, 1) / owners
+    value, _ = blend([
+        ("adoption", 0.5 + 0.5 * min(1.0, math.log2(1 + owners) / 11.0), 0.40),
+        ("not_sprawl", 1.0 / (1.0 + math.log2(max(cpo, 1.0))), 0.20),
+    ])
+    return value
+
+
+def test_wide_adoption_beats_intra_account_sprawl():
+    """The whole point of counting owners rather than copies.
+
+    Both of these have ~1,500-2,000 copies. One is 1,820 different people
+    vendoring a skill; the other is 502 accounts holding three copies each.
+    Raw copy count cannot tell them apart and scored both as boilerplate.
+    """
+    adopted = _distinct_family(dup_count=1998, owner_count=1820)
+    sprawled = _distinct_family(dup_count=1514, owner_count=502)
+    assert adopted > sprawled
+
+
+def test_adoption_does_not_punish_rare_skills():
+    """A rare skill must stay competitive; adoption is a bonus, not a tax."""
+    rare = _distinct_family(dup_count=1, owner_count=1)
+    assert rare >= 0.6, "a novel one-of-a-kind skill must not be buried"
+
+
+def test_more_owners_scores_higher_at_equal_copies():
+    """Holding copies fixed, spreading them across owners must help."""
+    few = _distinct_family(dup_count=100, owner_count=5)
+    many = _distinct_family(dup_count=100, owner_count=95)
+    assert many > few
+
+
+def test_single_owner_hoarding_is_penalised():
+    """One account with 50 copies of a file is not 50 endorsements."""
+    hoard = _distinct_family(dup_count=50, owner_count=1)
+    genuine = _distinct_family(dup_count=50, owner_count=48)
+    assert genuine > hoard * 1.3

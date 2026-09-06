@@ -390,6 +390,7 @@ def score_skill(
     w: Weights = Weights(),
     *,
     dup_count: int = 1,
+    owner_count: int = 1,
     name_collisions: int = 1,
     author_score: float | None = None,
 ) -> tuple[float, dict]:
@@ -397,9 +398,31 @@ def score_skill(
     repo_score, repo_detail = score_repo(repo, stats)
     craft, craft_detail = craft_score(skill, stats)
 
+    # How many *different people* hold a copy, and how many copies each holds.
+    # Raw copy count cannot tell these apart, and they mean opposite things.
+    owners = max(int(owner_count or 1), 1)
+    copies_per_owner = max(dup_count, 1) / owners
+
     distinct, dist_detail = blend([
-        # Copies dilute: 1 copy is unique, 10 copies is boilerplate.
-        ("uniqueness", 1.0 / (1.0 + math.log2(max(dup_count, 1))), 0.60),
+        # Adoption. This signal used to be `uniqueness`: 1/(1+log2(copies)),
+        # on the reasoning that "1 copy is unique, 10 copies is boilerplate".
+        # Measured against the corpus, that is backwards for the dominant case.
+        # The most-copied skills sit in *different owners'* accounts at a ratio
+        # of 0.87-0.95 — skill-creator has 1,998 copies across 1,820 distinct
+        # owners — so the copies are ~1,800 independent people each choosing to
+        # vendor it. That is adoption evidence, structurally the same as a
+        # citation count, and the old signal demoted precisely the skills the
+        # community had most clearly endorsed.
+        #
+        # Floored at 0.5 rather than scaled from 0, so a genuinely rare skill
+        # is not punished for being rare — adoption is a bonus for the widely
+        # held, not a tax on the obscure.
+        ("adoption", 0.5 + 0.5 * min(1.0, math.log2(1 + owners) / 11.0), 0.40),
+        # Sprawl. The original insight survives where it actually applies:
+        # clone-website has 1,514 copies across only 502 owners (0.33), which
+        # is one account duplicating a file rather than a community adopting
+        # it. Copies-per-owner separates the two cleanly.
+        ("not_sprawl", 1.0 / (1.0 + math.log2(max(copies_per_owner, 1.0))), 0.20),
         ("name_uniqueness", 1.0 / (1.0 + 0.5 * math.log2(max(name_collisions, 1))), 0.20),
         # A repo of 12 curated skills beats one of 4,000 scraped ones.
         ("repo_focus", 1.0 if (repo["skill_count"] or 1) <= 60 else
@@ -458,13 +481,15 @@ def recompute(store, w: Weights = Weights(), *, keep_detail: bool = True) -> dic
         updates,
     )
 
-    dup_counts = {
-        r["content_hash"]: r["c"]
-        for r in store.db.execute(
-            "SELECT content_hash, COUNT(*) c FROM skills "
-            "WHERE content_hash != '' GROUP BY content_hash"
-        )
-    }
+    dup_counts = {}
+    owner_counts = {}
+    for r in store.db.execute(
+        "SELECT s.content_hash AS h, COUNT(*) AS c, "
+        "       COUNT(DISTINCT substr(s.repo, 1, instr(s.repo,'/') - 1)) AS o "
+        "FROM skills s WHERE s.content_hash != '' GROUP BY s.content_hash"
+    ):
+        dup_counts[r["h"]] = r["c"]
+        owner_counts[r["h"]] = r["o"]
 
     # Duplicate counts must be written before authors are profiled: originality
     # is measured from them, and a stale dup_count would credit a wholesale
@@ -500,6 +525,7 @@ def recompute(store, w: Weights = Weights(), *, keep_detail: bool = True) -> dic
         score, detail = score_skill(
             s, repo, stats, w,
             dup_count=dups,
+            owner_count=owner_counts.get(s["content_hash"], 1),
             name_collisions=name_counts.get(s["name"], 1),
             author_score=authors.get(s["repo"].split("/", 1)[0]),
         )
