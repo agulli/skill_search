@@ -7,10 +7,18 @@
 ## Abstract
 
 skill-engine discovers, harvests, validates, ranks and serves the public corpus
-of AI agent skills — `SKILL.md` files — published on GitHub. It indexes
-**100,006 skills** (95,725 valid, 87,033 unique after content-hash dedupe) from
-**6,147 repositories** by **4,889 authors**, drawn from a discovered pool of
-**23,367 repositories**. Search returns in **60–210 ms** over that corpus.
+of AI agent skills — `SKILL.md` files — published on GitHub. The crawl has
+reached **3.12M skills** (2.01M unique after content-hash dedupe) from **1.27M
+harvested repositories**, drawn from a discovered pool of **2.6M**. The index
+currently in production is a **100,006-skill** cut of it (87,033 unique) serving
+in **25–130 ms**, and section 9 explains why the largest corpus is deliberately
+not the one deployed.
+
+Two scales are discussed throughout, and they are not interchangeable. The 100k
+figures describe a corpus small enough that everything fits in cache and 87% of
+documents are unique. The multi-million figures describe a different regime, in
+which duplication, disk, and an upstream byte limit dominate — and in which
+several decisions that were right at 100k became wrong.
 
 The results that matter, and what produced them:
 
@@ -24,7 +32,17 @@ The results that matter, and what produced them:
 | Discovery cost | **3,560 repos for 0 API requests** | awesome-list README mining |
 | Search latency | **2,135 ms → 60 ms** | connection reuse, single-pass faceting, stopwords, page-cache sizing |
 
-Three findings generalise beyond this project:
+Findings from scaling to millions, added after the original 100k build:
+
+| Result | Figure | Mechanism |
+|---|---|---|
+| Harvest throughput unblocked | **2,055 → 9,256 repos/h** | batch size decoupled from concurrency |
+| Round transition | **3.5 hours → 2 seconds** | inter-round reranking disabled during crawl |
+| Crawl database | **66 GB → 14 GB** | body cap, stale FTS cleared, vacuum |
+| Upstream ceiling identified | **bytes, not requests** | a big-repo sweep that lost more than it gained |
+| Refusals per hour under load | **169 → 1–5, and zero 403s** | global AIMD backoff honouring `Retry-After` |
+
+Five findings generalise beyond this project:
 
 1. **The scarce resource is rarely the one you optimise for by default.** Three
    separate times, a limit that looked binding was not: the REST quota (bypassed
@@ -35,6 +53,14 @@ Three findings generalise beyond this project:
    constant was picked by intuition it silently inverted the ranking.
 3. **Ordering beats volume.** Crawling in predicted-quality order reached a
    100,000-skill target using 26% of the queue.
+4. **More corpus is not more product.** Going from 100k to 1.44M documents
+   *improved* precision at rank 1 and *degraded* recall at rank 10, because
+   near-identical copies crowd the candidate pool before deduplication runs.
+   Volume without a retrieval layer that can exploit it makes search worse.
+5. **A measurement at n=100 is a rumour.** An A/B that looked like a clear win
+   at n=100 was flat at n=300 — and then turned out to have been run on a
+   corpus where the variable under test barely varied. Both checks were cheap;
+   neither was optional.
 
 ---
 
@@ -99,9 +125,9 @@ No single source finds everything, so five run in parallel.
 
 | Source | Cost | Measured yield |
 |---|---|---|
-| Repository search | search bucket only | 23,367 repos, fully populated |
+| Repository search | search bucket only | 2.6M repos discovered; still ~19% novel per probe at 1.17M known |
 | Awesome-list mining | **0 API requests** | 3,560 repos from 2 README fetches |
-| GH Archive | **0 API requests** | near-real-time updates to known repos |
+| GH Archive | **0 API requests** | ~25 new repos per archive-hour, but *only* the trailing week — older windows yield zero |
 | Code search | 10 req/min, capped | repos whose name and topics reveal nothing |
 | Owner expansion | 1–3 req/owner | authors who published once usually published more |
 
@@ -211,6 +237,55 @@ Rate-limit backoffs are counted separately from error retries — waiting out a
 quota window is normal operation, not a failure — and both are bounded so a
 request cannot loop forever.
 
+**codeload has no quota header, so its limit must be measured.** After roughly
+forty hours of continuous crawling it began returning 429s — 169 in one hour.
+The original handler slept 30 seconds inside the single task that was refused
+and marked that repository failed, which left the other 39 workers hitting the
+endpoint at the unchanged rate. The refusals continued, the pause repeated, and
+throughput sawtoothed instead of settling.
+
+The response is now global, and is ordinary congestion control:
+
+* A 429 doubles the delay between request *starts* for every worker, not just
+  the one refused, and pauses them all.
+* The pause honours `Retry-After` when the server sends one, bounded to 300s.
+  Guessing a duration the server has stated is both worse behaved and worse
+  engineering — too short walks back into the refusal, too long idles for
+  nothing.
+* Each success walks the delay back down. The step matters as much as the
+  backoff: at 0.01 the delay recovered a doubling in about eight seconds and
+  immediately earned another refusal — four in ten minutes, oscillating between
+  the safe rate and the rejected one. At 0.001, recovery takes minutes.
+* Recovery accelerates only after 10 and 30 minutes without a refusal, capped
+  at 4x. A long quiet period is evidence the limit has lifted; the first
+  success after a refusal is evidence of nothing. The cap is deliberate: this
+  is a taper, not a search for the boundary.
+
+Observed converging on first deployment: 0.25 → 0.50 → 1.00 → 1.81 → 3.00s,
+then quiet. Across the following day: 1–5 refusals an hour, hours at a time held
+at maximum pacing, **zero 403s over 30+ hours and 3.1M skills**.
+
+**403 is not 429, and treating them alike hid a real signal.** Both were
+originally handled by the same branch, which made a block and a throttle
+indistinguishable in the logs — and backing off, the correct response to a 429,
+does nothing about a 403. They are now separate: five 403s within ten minutes
+trips a breaker that stops the sweep outright rather than finishing the batch,
+because every further request while forbidden makes a temporary block likelier
+to become permanent. A single 403 does not halt a multi-day crawl, since a few
+are per-repository — takedowns, disabled repositories — rather than about us.
+The queue is the checkpoint, so stopping costs nothing but time.
+
+**On rate limits as an adversary.** It is worth stating what this system does
+not do. All traffic originates from one address, one User-Agent, one token;
+nothing is hidden and nothing could be without changing identity. Backing off
+on a 429 and recovering slowly is what a well-behaved client is *supposed* to
+do — `Retry-After` exists precisely because servers expect clients to return.
+That is a different activity from timing requests to stay under a detector,
+which presumes the operator would object if they understood. The practical case
+matches the principled one: visible compliance is what has kept this crawl at
+zero blocks, whereas an address that appears to be gaming a limit gets stopped
+at the account level, which costs the token and the project, not just the IP.
+
 ### 3.6 Rejected alternatives
 
 | Rejected | Why |
@@ -219,6 +294,11 @@ request cannot loop forever.
 | **Code Search as the backbone** | 10 req/min, capped at 1,000 results, requires a search term. A seed source, not an engine |
 | **A GitHub App** | Installation tokens are scoped to repositories where the app is installed; you cannot install one on strangers' repositories. Useful only for your own org |
 | **Per-file `contents` API** | Costs core quota per file; `raw.githubusercontent.com` does not |
+| **BigQuery's public GitHub dataset** | Frozen at **2022-11-26**. 228 files across 2.3 billion match `SKILL.md` or `.claude/skills`, because agent skills are a 2024–25 convention. Recommended three times on the assumption that a bulk source is a fresher one; a $0.81 count query settled it. Check a dataset's modified date before designing around it |
+| **Sharding the sweep across processes** | Tested to determine whether codeload's limit was per-connection. Four processes over disjoint queue slices gave **6,400 repos/h against one process's 9,256** — the modulo predicate defeats the `repos_score` index, and the limit is per-IP anyway |
+| **Deep GH Archive mining** | Windows older than about a week yield **zero** new candidates; the earlier crawl already covered them. Only the trailing week is worth mining, at ~25 new repositories per archive-hour |
+| **The REST harvest running beside the codeload sweep** | Uses a different quota bucket, so it looked additive. Measured **210 repos/h against the sweep's 8,000** while contending for the write lock. Net negative |
+| **A dedicated large-repository sweep** | Repositories of 10–50 MB average 40.1 skills against 5.9 for smaller ones, suggesting 36,516 excluded repositories held a million skills. Measured: **+4,524 skills/h gained, −6,129 lost** to the bandwidth it took from the main sweep. The 40.1 average was survivorship — the best-ranked large repositories had already been crawled, and the remainder average 14.9 |
 
 ---
 
@@ -263,10 +343,19 @@ Observed distribution:
 
 ### 4.2 Storage
 
-SQLite with FTS5 — a deliberate choice, not a placeholder. The corpus is 100k
-documents; FTS5 ranks that with BM25 in tens of milliseconds, in one file, with
-no server. The schema maps cleanly onto Postgres + `tsvector` if it outgrows
-that.
+SQLite with FTS5 — a deliberate choice, not a placeholder. At 100k documents
+FTS5 ranks with BM25 in tens of milliseconds, in one file, with no server. The
+schema maps cleanly onto Postgres + `tsvector` if it outgrows that.
+
+It has since been pushed considerably further, and the limits found were not the
+ones expected. A 3.1M-skill crawl database is entirely workable for writing and
+aggregation; what degrades is *serving* — the 1.44M shipped index measures 87 ms
+at p50 against the 100k index's 7 ms, because the working set no longer fits the
+page cache of a small machine. The constraint is memory for the cache, not
+SQLite. Two related lessons: the write-ahead log grows without bound if the FTS
+triggers are left live during a bulk rewrite (categorising alone pushed it past
+15 GB), and `VACUUM` needs room for a second copy, which is what made a 70 GB
+crawl database undeployable on a 155 GB disk.
 
 Current shape: **2.49 GB** total, of which the FTS index is **1.09 GB**. Average
 skill body is 7,809 characters.
@@ -295,6 +384,67 @@ Trigger-driven inserts create one FTS5 segment per commit. After 100k skills
 across thousands of crawl batches the index held **211,656 segment rows**;
 compaction merged them to 94,077 and cut query time ~17%. `skill-engine rank`
 now runs `optimize` and `ANALYZE` automatically.
+
+## 4b. What changed at three million
+
+The 100k build and the multi-million build are different engineering problems.
+Four decisions that were correct at the smaller scale became wrong at the
+larger one, and each was found by measurement rather than review.
+
+### 4b.1 Batch size must not equal concurrency
+
+The sweep ran with `batch=24` against `concurrency=24`, so exactly one batch was
+ever in flight and it could not finish until its slowest member did: one large
+tarball stalled twenty-three completed downloads. The sweep held **0.6 repos/s
+against a pacing floor permitting 6.7**.
+
+Widening the batch to 400 while leaving concurrency at 40 keeps the semaphore
+saturated — as each fetch finishes the next starts, so stragglers overlap with
+useful work instead of blocking it. Throughput went from **2,055 to 9,256
+repos/h**, a 4.5x improvement from one number.
+
+### 4b.2 The upstream limit is bytes, not requests
+
+Above ~9,000 repos/h, more concurrency made throughput *worse*: 100 connections
+measured 8,704 repos/h against 40 connections' 9,256, at 30% CPU, 14 Mbps and no
+failures. Nothing local was saturated, which pointed upstream but did not say
+which resource.
+
+A dedicated large-repository sweep settled it. If the limit were on *requests*,
+fetching 40-skill repositories instead of 6-skill ones would be a large win. It
+was not: the large sweep gained 4,524 skills/h and cost the main sweep 6,129.
+Under a byte ceiling, small repositories are simply better value per byte, and
+taking bandwidth from them is a net loss.
+
+### 4b.3 Ranking during a crawl is pure waste
+
+Each 100,000-repository round ended with a full `recompute`: corpus statistics
+over 1.43M repositories, profiling 212,343 authors, then scoring everything.
+That took **3.5 hours during which the crawler harvested nothing** — a third of
+its throughput.
+
+The work is redundant while crawling. `release.py` ranks once from the finished
+corpus, and a mid-crawl ordering only decides which repositories are swept next.
+Disabled, the same round transition takes **two seconds**.
+
+### 4b.4 Storing full bodies made the corpus undeliverable
+
+At 2.47M skills the crawl database reached **70.8 GB** — 28 KB per skill, nearly
+all body text. That made 5M skills reachable and a release from them impossible:
+`release.py` needs a snapshot plus a compacted copy, roughly 258 GB against 155
+GB free.
+
+Bodies are now capped at 4,000 characters on write. Nothing the shipped index
+keeps is lost, because `release.py` already truncated to 2,000 — and that
+measured *better* on every retrieval metric, since truncation removes spurious
+matches deep in long documents. `content_hash` and `body_len` are computed
+upstream from the full text, so deduplication and recorded lengths are
+unaffected.
+
+With a one-time trim, clearing the stale full-text index, and a vacuum:
+**66 GB → 14 GB**, all 2,491,950 skills intact.
+
+---
 
 ### 4.4 Deduplication
 
@@ -342,7 +492,7 @@ Skill score:
 | craft | 0.33 | validity, description fit, body depth, bundled resources, declared tools, spec cleanliness |
 | repo standing | 0.32 | the repository score above |
 | author standing | 0.16 | see §5.5 |
-| distinctiveness | 0.19 | content uniqueness, name uniqueness, repository focus |
+| distinctiveness | 0.19 | adoption, sprawl, name uniqueness, repository focus |
 
 ### 5.3 Two structural rules
 
@@ -367,6 +517,42 @@ small additive wins elsewhere.
 | template | ×0.90 | 69 |
 | unlicensed | ×0.93 | 2,488 |
 | inorganic popularity | ×0.72 | 2 |
+
+### 5.3b Adoption, not "uniqueness" — a signal that was backwards
+
+The distinctiveness family originally contained a signal computed as
+`1 / (1 + log2(copies))`, on the reasoning that *one copy is unique, ten copies
+is boilerplate*. Measured against the corpus, that is backwards for the dominant
+case.
+
+The most-copied skills sit in **different owners'** accounts:
+
+| skill | copies | distinct owners | owners per copy |
+|---|---|---|---|
+| `skill-creator` | 1,998 | 1,820 | 0.91 |
+| `webapp-testing` | 1,455 | 1,356 | 0.93 |
+| `canvas-design` | 1,232 | 1,174 | 0.95 |
+| `clone-website` | 1,514 | 502 | **0.33** |
+
+At 0.9 owners per copy, those are ~1,800 independent people each choosing to
+vendor a skill. That is adoption evidence — structurally the same as a citation
+count — and the old signal demoted precisely the skills the community had most
+clearly endorsed.
+
+Raw copy count cannot distinguish that from one account holding three copies of
+a file, which is why it was the wrong variable rather than the wrong sign.
+Counting **distinct owners** can, so the original insight survives where it
+applies: `clone-website` at 0.33 owners per copy is intra-account sprawl and is
+still penalised. Adoption is floored at 0.5, so a rare skill is not taxed for
+being rare — adoption is a bonus for the widely held, not a tax on the obscure.
+
+The measurement discipline here is worth recording, because the first two
+attempts to validate this change were both worthless. An A/B at n=100 showed a
+clear improvement; the same A/B at n=300 was flat. And the corpus it ran on —
+the deployed 100k index — turned out to have **95.8% single-owner skills**, so
+the signal could not fire at all and the scores merely shifted uniformly, which
+reorders nothing. A change can be well-justified, harmless, and still unproven;
+this one is.
 
 ### 5.4 Calibration, and the inorganic-popularity guard
 
@@ -490,6 +676,25 @@ against each other is useless and actively harmful: BM25's length normalisation
 seated a **zero-star fork above the original it was copied from**, because the
 fork's repo and path fields were shorter. Results collapse on content hash,
 keeping the highest-quality copy and reporting a count of the rest.
+
+**Collapsing after retrieval stops working at scale.** Search over-fetches five
+times the requested results and collapses afterwards, so ten results are chosen
+from fifty candidates. That multiplier was tuned when 87% of the corpus was
+unique. At 66% unique it fails: a query matching `skill-creator` — which has
+1,998 copies — pulls copies of one file into most of those fifty slots, and
+after collapsing there is almost nothing left.
+
+This is the mechanism behind the most counter-intuitive measurement in the
+project. Going from 100k to 1.44M documents *improved* precision at rank 1
+(0.48 → 0.64 on 8-term queries) and *degraded* recall at rank 10 (0.93 → 0.80,
+and 0.82 → 0.49 on 3-term queries). More candidates mean the genuinely best one
+is more likely present; they also mean the rest of the page fills with clones of
+it. Short, vague queries — what users actually type — suffer most.
+
+The structural fix is to deduplicate at **build** time, keeping one row per
+content hash and carrying the copy count onto the survivor. Raising the
+over-fetch multiplier is the tempting cheap fix and is wrong: no multiplier
+survives a 1,998-copy cluster.
 
 ### 6.4 Result diversity
 
@@ -669,6 +874,47 @@ false negative in a search engine is total: the skill simply cannot be found.
 
 ---
 
+### 7.6 A batch that could not outrun its slowest member
+
+`batch=24` against `concurrency=24` meant one batch in flight, finishing only
+when its slowest member did. One large tarball stalled twenty-three completed
+downloads, holding the sweep at 0.6 repos/s against a floor permitting 6.7.
+Decoupling the two — batch 400, concurrency 40 — was a 4.5x improvement from a
+single number, and no profiler would have pointed at it: nothing was slow, the
+work was simply serialised behind its worst case.
+
+### 7.7 A local backoff that made refusals worse
+
+Sleeping 30 seconds inside the one task that received a 429, while 39 others
+continued at the unchanged rate, is not backing off — it is backing off one
+thread. Refusals continued, the pause repeated, throughput sawtoothed. The fix
+was to make the response global; the subtlety was that the *recovery* step
+mattered as much as the backoff, since too fast a recovery reproduces the
+oscillation with extra steps.
+
+### 7.8 Three signals that were measured and discarded
+
+Recorded because a negative result that is not written down gets re-attempted:
+queue sharding (worse — the modulo predicate defeats the score index), the REST
+harvest running beside the sweep (210 repos/h against 8,000, while contending
+for the write lock), and a large-repository sweep (gained 4,524 skills/h, cost
+6,129). The last of these is the useful one: it is what established that the
+upstream limit is on bytes rather than requests, which no amount of tuning
+concurrency had settled.
+
+### 7.9 An assumption about freshness that survived three recommendations
+
+BigQuery's public GitHub dataset was proposed three times as the way past
+codeload's ceiling, on the reasoning that a bulk source must be faster than a
+crawler. It is — for 2022. The dataset is frozen at 2022-11-26 and contains 228
+files matching `SKILL.md` across 2.3 billion, because agent skills postdate it
+entirely. A $0.81 count query settled what three rounds of argument had not.
+The lesson is not about BigQuery: *check a dataset's modified date before
+designing around it*, and prefer the cheap query that could falsify a plan over
+the expensive one that assumes it.
+
+---
+
 ## 8. Design choices, consolidated
 
 | Choice | Alternative | Rationale |
@@ -676,7 +922,7 @@ false negative in a search engine is total: the skill simply cannot be found.
 | Git Trees API as REST backbone | Code Search | One request lists every path; code search caps at 1,000 results and 10 req/min |
 | codeload archives as primary path | REST trees | Zero API quota, ~16,000 repos/hour |
 | PAT pool | GitHub App | Installation tokens cannot read strangers' repositories |
-| SQLite + FTS5 | Postgres, Elasticsearch | 100k docs rank in tens of ms, one file, no server; migrates cleanly if outgrown |
+| SQLite + FTS5 | Postgres, Elasticsearch | 100k docs rank in tens of ms, one file, no server. Holds to millions for writing; serving degrades once the working set outgrows the page cache, which is a memory limit rather than a SQLite one |
 | Exact vector scan | ANN index | Correct at this size; no index to rebuild per crawl |
 | Percentile normalisation | Log constants | Corpus-relative, survives growth |
 | Scoring as a separate pass | Score during crawl | Percentiles need the whole corpus |
@@ -697,18 +943,36 @@ signal than raw counts: `stars_per_day` separates 500 stars this month from 500
 over three years, and `fork_ratio` separates what people use from what they
 bookmark.
 
-**Coverage.** 6,147 of 23,367 discovered repositories are harvested; 17,228
-remain queued. A uniform random sample of the remainder shows 88% contain at
-least one skill at 3.72 skills/repo (bootstrap 95% CI 2.28–5.40), implying
-roughly 60,000 further skills at a much lower yield per gigabyte, since crawl
-ordering has already taken the dense repositories.
+**Coverage.** 1.27M of 2.6M discovered repositories are harvested; the rest
+remain queued, and the backlog is *growing* — discovery runs roughly four times
+faster than harvesting, so the crawl does not converge on its own. Under the
+adaptive throttle the sweep sustains 1,000–10,000 repositories an hour, which
+makes the remaining queue weeks of work rather than days.
 
-**The wider ceiling is unmeasured.** `"SKILL.md" in:readme` reports 323,417
-repositories, but that matches README *text*, not repositories containing the
-file. A 40-repository probe returned ~85%, but GitHub caps any query at 1,000
-retrievable results, so that sample necessarily came from the most-recently-
-updated slice — exactly the repositories most likely to contain skills. Treat
-"hundreds of thousands" as plausible, not measured.
+**The population estimate is soft.** Three methods roughly agree on 4.5–6M raw
+skills: GitHub's code search reports ~5.77M `SKILL.md` files (a heavily rounded
+estimate — exactly 5.5 × 2²⁰ — not a count); draining the current queue at the
+measured 4.23 skills/repo projects 5.3M; and fitting the decay in discovery
+novelty (29.4% new at 711k repositories known, 19.0% at 1.17M) implies a
+searchable population near 1.4–1.6M repositories. None of these is a measurement
+of the thing itself, and yield decays as the crawl works down the queue, so the
+lower end is likelier.
+
+**Quality dilutes with scale, measurably.** Comparing the deployed 100k index
+with the 2.97M crawl:
+
+| | 100k | 2.97M |
+|---|---|---|
+| valid | 95.7% | 93.0% |
+| unique | **87.0%** | **66.3%** |
+| licensed | **90.2%** | **50.5%** |
+
+A third of the large corpus is redundant, and the redundancy is concentrated:
+**366,099 rows — 12% — are copies of just 2,901 skills**, overwhelmingly the
+canonical starter skills that thousands of projects vendor. The halving of
+licence coverage matters separately: anyone who needs to know they may legally
+reuse a skill is served much worse by the larger corpus, which argues for
+surfacing licence as a filter rather than hiding it.
 
 **Originality is corpus-relative.** It means "first or only holder of this
 content hash *in our index*". If the copy was indexed and the original was not,
@@ -718,10 +982,21 @@ the copier receives undeserved credit. Completing the crawl tightens this.
 are at 0% coverage; their weights are currently redistributed. Each costs 1–2
 API requests per subject.
 
-**No relevance evaluation set.** Ranking is validated by property tests and
-spot-checks, not by a labelled judgement set. That is the largest gap: there is
-no measurement of whether a weight change improves or degrades relevance beyond
-inspection.
+**No relevance evaluation set.** Ranking is validated by property tests, a
+label-free known-item benchmark, and spot-checks — not by human judgements.
+The benchmark measures whether a *specific* skill can be found from its
+description, which is a genuine signal but not the whole of relevance: it does
+not reward surfacing the *canonical* copy among equivalents, which is precisely
+what the adoption signal is for. A change can therefore be invisible to it and
+still be right, or visible to it and still be noise. Both happened.
+
+**The largest corpus is deliberately not deployed.** The 1.44M index measured
+*worse* than the 100k on short queries (MRR 0.313 against 0.441), needs a
+machine roughly five times larger, and is 12x slower at p50. Serving it would
+mean paying more for a worse experience. The corpus is ahead of the retrieval
+layer, and the work that would let volume pay off — build-time deduplication
+and embeddings — is not done. Crawling further is currently the *least*
+valuable thing that could be done to this project.
 
 ---
 
