@@ -14,6 +14,30 @@ it arrived by.
     python bigquery_ingest.py --project my-gcp-project --sample   # cheap test
     python bigquery_ingest.py --project my-gcp-project            # the real run
 
+DO NOT RUN THIS EXPECTING SKILLS. Measured 2026-09-06, and the reason this
+file is kept rather than deleted:
+
+    files      2,309,424,945 rows   last modified 2022-11-26
+    contents     281,191,977 rows   last modified 2022-11-27
+    sample_files  72,879,442 rows   last modified 2016-06-28
+
+    files matching SKILL.md / .claude/skills across the whole dataset:  228
+
+The public dataset is a snapshot frozen in **November 2022**. Agent skills are a
+2024-2025 convention — SKILL.md, `.claude/skills/`, none of it existed when the
+snapshot was taken. Two hundred and twenty-eight matches in 2.3 billion files is
+not a corpus, it is noise, and the full extraction would have cost $10-20 to
+retrieve almost nothing.
+
+The lesson is about the method, not the dataset: "bulk source, therefore faster"
+was an assumption about *freshness* that nobody checked, and it survived three
+recommendations before a $0.81 count query settled it. Check the modified date
+before designing around a dataset.
+
+The code is left working because the dataset may be refreshed, and because the
+ingestion path — same parser, same store, same content hash as the crawler — is
+the right shape for any future bulk source.
+
 Nothing runs before a dry run reports what it will scan and cost, and the real
 run needs `--yes` on top of that. BigQuery bills on bytes scanned across every
 column referenced, and `contents.content` is most of a multi-terabyte table —
