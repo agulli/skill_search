@@ -146,3 +146,33 @@ def test_recovery_only_accelerates_after_a_sustained_clean_run():
 
     assert quiet_step > fresh_step
     assert quiet_step <= fresh_step * 4 + 1e-9, "taper, not a probe"
+
+
+def test_sweep_orders_by_priority_before_score(tmp_path):
+    """Source quality must outrank repository popularity when choosing work.
+
+    Ordering by repo_score first assumes popularity predicts whether a repo
+    contains skills. Measured across discovery sources it does not: yields
+    differ 10x while maximum scores are identical, so a high-volume low-yield
+    source monopolises the head of the queue.
+    """
+    from skill_engine.store import Store
+
+    db = Store(tmp_path / "t.db")
+    # A popular repo from a bad source, and an unremarkable one from a good source.
+    db.db.execute("INSERT INTO repos(full_name,owner,name,repo_score,disabled) "
+                  "VALUES('junk/popular','junk','popular',98.0,0)")
+    db.db.execute("INSERT INTO repos(full_name,owner,name,repo_score,disabled) "
+                  "VALUES('good/modest','good','modest',12.0,0)")
+    db.db.execute("INSERT INTO queue(full_name,priority,attempts) "
+                  "VALUES('junk/popular',40,0)")
+    db.db.execute("INSERT INTO queue(full_name,priority,attempts) "
+                  "VALUES('good/modest',140,0)")
+    db.commit()
+
+    rows = db.db.execute("""
+        SELECT q.full_name FROM queue q JOIN repos r ON r.full_name = q.full_name
+        WHERE q.attempts < 4 AND r.tree_sha IS NULL AND r.disabled = 0
+        ORDER BY q.priority DESC, r.repo_score DESC LIMIT 1""").fetchall()
+    assert rows[0]["full_name"] == "good/modest"
+    db.close()

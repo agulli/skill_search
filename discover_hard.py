@@ -64,18 +64,33 @@ TOPICS = ["claude", "claude-ai", "claude-code", "claude-skills", "agent-skills",
 
 
 def query_plan() -> list[str]:
-    """Distinct framings of the same space, widest-yield first."""
+    """Framings that actually yield skills, measured rather than assumed.
+
+    This began as 132 queries built by crossing the core terms with languages
+    and star bands, on the theory that partitioning the space differently
+    reaches repositories a plain query ranks too low to surface. It does — and
+    they are the wrong repositories. Measured by discovery source after 736,308
+    of them were harvested:
+
+        topic:claude-skills   87.2% productive   10.25 skills/repo
+        topic:agent-skills    90.6%               8.60
+        date-sharded search   56.8%               4.36
+        GH Archive            24.0%               3.92
+        broad cross-products   8.9%               0.64
+
+    The cross-products queued 1.3M repositories at 0.64 skills each and, being
+    93% of the queue, crowded everything else out: one six-hour stretch
+    harvested 11,848 repositories for five productive ones. `language:` and
+    `stars:` partition GitHub, not the skill corpus — a popular Python
+    repository matches "agent language:Python" and contains no skills.
+
+    Kept: the terms that name the thing being looked for. Dropped: the
+    partitions that merely enumerate GitHub.
+    """
     qs: list[str] = []
     qs += CORE
     qs += [f"topic:{t}" for t in TOPICS]
-    qs += list(KEYWORD_QUERIES) + list(SCALE_QUERIES) + list(BREADTH_QUERIES)
-    # Cross-products: the long tail that plain queries never reach.
-    for lang in LANGS:
-        qs += [f"skill language:{lang}", f"agent language:{lang}",
-               f"claude language:{lang}"]
-    for band in STARS:
-        qs += [f"agent skill {band}", f"claude skill {band}",
-               f"SKILL.md in:path {band}"]
+    qs += list(KEYWORD_QUERIES) + list(SCALE_QUERIES)
     seen, out = set(), []
     for q in qs:
         if q not in seen:
@@ -99,7 +114,11 @@ async def main() -> int:
                 try:
                     seen, new = await search_repos(
                         gh, store, q, since=date(2021, 1, 1),
-                        reason="discover-hard", priority=130,
+                        # Below the proven sources (topics 140, search/archive
+                        # 130). This was 130 — tied with them — which is how a
+                        # source yielding 0.64 skills/repo came to monopolise a
+                        # queue it shared with sources yielding 10.
+                        reason="discover-hard", priority=110,
                     )
                 except Exception as exc:                       # one bad query
                     log.warning("query %r failed: %s", q[:40], type(exc).__name__)

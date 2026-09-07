@@ -384,7 +384,17 @@ async def run_tarball_crawl(
                   AND COALESCE(r.size_kb, 0) >= ?
                   AND r.disabled = 0
                   AND (? = 1 OR q.rowid % ? = ?)
-                ORDER BY r.repo_score DESC, q.priority DESC
+                -- Priority first, score second. Ordering by repo_score alone
+                -- assumes repository popularity predicts skill *presence*; it
+                -- does not. Measured by discovery source, yield differs 10x
+                -- (topic:claude-skills 87.2% productive at 10.25 skills/repo;
+                -- broad keyword search 8.9% at 0.64) while both reach the same
+                -- maximum score of ~98. With the low-yield source at 93% of the
+                -- queue it therefore monopolised the head of the ordering, and
+                -- the sweep spent six hours harvesting 11,848 repositories for
+                -- five productive ones. Source quality is the stronger prior;
+                -- score now breaks ties within a band.
+                ORDER BY q.priority DESC, r.repo_score DESC
                 LIMIT ?
                 """,
                 (max_mb * 1024, min_kb, shards, shards, shard, batch),
