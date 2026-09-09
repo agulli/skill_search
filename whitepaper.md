@@ -298,7 +298,7 @@ at the account level, which costs the token and the project, not just the IP.
 | **Sharding the sweep across processes** | Tested to determine whether codeload's limit was per-connection. Four processes over disjoint queue slices gave **6,400 repos/h against one process's 9,256** — the modulo predicate defeats the `repos_score` index, and the limit is per-IP anyway |
 | **Deep GH Archive mining** | Windows older than about a week yield **zero** new candidates; the earlier crawl already covered them. Only the trailing week is worth mining, at ~25 new repositories per archive-hour |
 | **The REST harvest running beside the codeload sweep** | Uses a different quota bucket, so it looked additive. Measured **210 repos/h against the sweep's 8,000** while contending for the write lock. Net negative |
-| **A dedicated large-repository sweep** | Repositories of 10–50 MB average 40.1 skills against 5.9 for smaller ones, suggesting 36,516 excluded repositories held a million skills. Measured: **+4,524 skills/h gained, −6,129 lost** to the bandwidth it took from the main sweep. The 40.1 average was survivorship — the best-ranked large repositories had already been crawled, and the remainder average 14.9 |
+| **A dedicated large-repository sweep** *(later reversed — see below)* | Measured while a productive small-repository queue existed: **+4,524 skills/h gained, −6,129 lost** to the bandwidth it took from the main sweep. Correct at the time and wrong later |
 
 ---
 
@@ -427,7 +427,36 @@ The work is redundant while crawling. `release.py` ranks once from the finished
 corpus, and a mid-crawl ordering only decides which repositories are swept next.
 Disabled, the same round transition takes **two seconds**.
 
-### 4b.4 Storing full bodies made the corpus undeliverable
+### 4b.4 The same measurement, two opposite answers
+
+The large-repository sweep was measured, found net negative, and disabled. Days
+later the identical change was measured again and found strongly positive. Both
+measurements were right; the *alternative* had changed.
+
+The first test ran while the queue still held productive small repositories at
+5.4 skills each, so bandwidth spent on a 25 MB archive was bandwidth taken from
+something already paying well. By the second test that queue was drained — what
+remained was a low-yield discovery source at **0.3 skills/repo**, while ~35,000
+repositories from the good sources sat untouched behind a 10 MB size cap.
+
+Against that alternative the large repositories are not marginally better but
+transformative:
+
+| | harvested | productive | skills/repo |
+|---|---|---|---|
+| under 10 MB | 607,141 | 48.1% | 4.33 |
+| **10–50 MB** | 3,201 | **50.3%** | **17.21** |
+
+Admitting them took the sweep from ~400 skills/hour to **~85,000**, with
+`topic:claude-skills` repositories returning **54.3 skills each**.
+
+The lesson is about what a throughput measurement actually measures. "Is X
+worth doing?" is never answered in isolation — it is answered against whatever
+X displaces, and that comparator moves as the system runs. A conclusion drawn
+from a benchmark carries an unstated clause about the conditions it was taken
+under, and the conclusion expires when they change.
+
+### 4b.5 Storing full bodies made the corpus undeliverable
 
 At 2.47M skills the crawl database reached **70.8 GB** — 28 KB per skill, nearly
 all body text. That made 5M skills reachable and a release from them impossible:
