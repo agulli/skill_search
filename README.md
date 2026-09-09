@@ -1,14 +1,17 @@
 # skill-engine
 
-A search engine for AI agent skills published on GitHub.
+A search engine for AI agent skills.
 
 Agent skills are `SKILL.md` files — Markdown with YAML frontmatter — scattered
-across tens of thousands of unrelated public repositories. There is no registry.
-skill-engine finds them, validates them, ranks them by quality, and serves
-search over the result.
+across hundreds of thousands of unrelated public repositories. There is no
+registry. skill-engine finds them, validates them, ranks them by quality, and
+serves search over the result.
 
-Currently indexes **100,006 skills** (95,725 valid, 87,033 unique) from **6,147
-repositories** by **4,889 authors**. Queries return in **60–210 ms**.
+The crawl has reached **3.36M skills** (2.17M unique after content-hash dedupe)
+from **371,465 repositories** by **212,343 authors**, across GitHub, GitLab and
+Hugging Face. The index in production is a **100,006-skill** cut of that,
+serving in **25–130 ms** — see [Which index to serve](#which-index-to-serve) for
+why the largest corpus is deliberately not the deployed one.
 
 ```bash
 pip install -e .
@@ -16,6 +19,14 @@ skill-engine mass-discover --target 25000   # find repositories
 skill-engine sweep --target 100000          # harvest them
 skill-engine rank                           # score everything
 skill-engine serve                          # UI + API on :8000
+```
+
+Beyond the web UI, the index is reachable two other ways:
+
+```bash
+python mcp_server.py --db dist/skills.db          # MCP tools for any agent
+python gemini_agent.py "how do I parse a PDF?"    # a Gemini agent using them
+python crawl_sources.py --db data/scale.db        # harvest GitLab + Hugging Face
 ```
 
 No GitHub token is required. 📄 **[whitepaper.md](whitepaper.md)** covers the
@@ -61,6 +72,8 @@ Five sources run in parallel, because none finds everything:
 | GH Archive | no API requests | pushes to repositories already indexed |
 | Code search | 10 req/min, capped at 1,000 | repos whose name and topics reveal nothing |
 | Owner expansion | 1–3 requests per owner | other work by authors who published once |
+| GitLab | no token | public projects, harvested by archive like GitHub |
+| Hugging Face | no token | Spaces and models that ship skills beside the weights |
 
 Repository search caps at 1,000 results per query, so `search_repos` recursively
 bisects the `created:` date range until every shard fits under the cap. Their
@@ -215,8 +228,19 @@ skill-engine stats                                 # totals + metadata coverage
 skill-engine serve         [--host 127.0.0.1] [--port 8000]
 ```
 
-`overnight.py` runs an unattended harvest, alternating archive sweeps with
-discovery whenever the queue runs low:
+Standalone scripts, outside the CLI because each is a separate job rather than
+a stage of the pipeline:
+
+```
+python overnight.py N DB              unattended harvest, sweeps + discovery
+python crawl_sources.py --db DB       GitLab and Hugging Face, no token needed
+python release.py SRC DST             build a servable index from a crawl
+python mcp_server.py --db DB          serve the index as MCP tools
+python gemini_agent.py "question"     a Gemini agent using those tools
+```
+
+`overnight.py` alternates archive sweeps with discovery whenever the queue runs
+low:
 
 ```bash
 python overnight.py 100000 data/big.db
@@ -280,6 +304,72 @@ client can build its own interface without a second round trip.
 
 > The server binds to `127.0.0.1` and has no authentication or rate limiting.
 > It is not ready to face the open internet as-is.
+
+## For agents: MCP
+
+The index is most useful to the thing that needs a skill, which is usually not a
+person at a keyboard. `mcp_server.py` exposes it over the Model Context Protocol
+so any MCP client can query it:
+
+```bash
+claude mcp add skill-engine -- /path/to/.venv/bin/python \
+    /path/to/mcp_server.py --db /path/to/dist/skills.db
+```
+
+Four tools, because they are the four questions an agent actually has:
+
+| Tool | Answers |
+|---|---|
+| `search_skills` | "is there a proven approach to this task?" |
+| `get_skill` | "what does that one actually say?" — full body |
+| `browse_category` | "what sort of thing is in here?" — no query needed |
+| `corpus_stats` | "what can you search?" — size, sources, subjects |
+
+Two deliberate constraints. The index is opened **read-only**: everything
+arriving at these tools originated in a model's output, which is untrusted by
+construction, and a tool that cannot write cannot be talked into writing.
+Results cap at ten, because tool output is pasted into a context window, where
+fifty results are not five times more useful than ten — only five times dearer.
+
+`search_skills` returns metadata; reading a skill is a second, explicit call.
+That keeps a search cheap and makes the agent choose before it spends context.
+
+### A worked example: Gemini
+
+`gemini_agent.py` is a complete agent built on that server — useful in itself
+and as a reference for wiring the tools to any model:
+
+```bash
+export GEMINI_API_KEY=...        # aistudio.google.com/apikey
+python gemini_agent.py "how do I extract tables from a PDF?"
+python gemini_agent.py           # interactive
+```
+
+It reads the tool schemas from the MCP server at startup rather than restating
+them, so there is only one description of each tool and it cannot drift. Tool
+calls are dispatched by an explicit loop with the SDK's automatic calling turned
+off, so exactly one thing invokes tools and the printed trace matches what ran.
+A failing tool call is returned to the model as an error payload rather than
+raised: it can recover by searching differently, whereas a traceback ends the
+conversation.
+
+## Which index to serve
+
+Bigger is not better here, and the largest corpus is deliberately not the
+deployed one. Measured on a label-free known-item benchmark, going from 100k to
+1.44M documents **improved** precision at rank 1 and **degraded** recall at
+rank 10 — badly on short queries (MRR 0.441 → 0.313).
+
+The cause is mechanical. Search over-fetches five times the requested results
+and collapses duplicates afterwards, so ten results are chosen from fifty
+candidates. That multiplier was set when 87% of the corpus was unique; at 66%
+unique a query matching a widely-vendored skill fills most of those fifty slots
+with copies of one file. Raising the multiplier does not fix it — no multiplier
+survives a cluster of 1,998 copies. Deduplicating at build time does.
+
+The larger index also needs roughly five times the machine and is 12x slower at
+p50. Until build-time deduplication and embeddings land, the 100k cut is the
+better product, and `release.py` can build a cut at any size.
 
 ## Deployment
 
