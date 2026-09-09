@@ -311,6 +311,11 @@ class Store:
                 "contributors": "INTEGER", "releases": "INTEGER",
                 "latest_release": "TEXT", "repo_score": "REAL DEFAULT 0",
                 "score_detail": "TEXT", "last_meta_at": "REAL",
+                # Which forge a repository came from. Defaults to GitHub so
+                # every existing row stays correct without a backfill; only
+                # non-GitHub sources set it. Kept on `repos` rather than
+                # `skills` because a repository lives on exactly one host.
+                "host": "TEXT DEFAULT 'github.com'",
             },
         }
         for table, columns in additions.items():
