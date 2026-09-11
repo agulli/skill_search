@@ -340,6 +340,21 @@ async def run_tarball_crawl(
     # question: if the upstream limit is on requests, big repos are a far
     # better use of each one; if it is on bytes, they are a worse one.
     min_kb = int(os.getenv("SKILL_ENGINE_MIN_SIZE_KB", "0"))
+    # A floor on queue priority, so the sweep can be confined to sources worth
+    # its bandwidth. Two problems at once:
+    #
+    # Yield — measured by priority band, the leftover pool at priority 40
+    # returns ~0.02 skills/repo against ~3.8 for freshly discovered
+    # candidates. Grinding 985,000 of the former for roughly 20,000 skills is
+    # four days of bandwidth for nothing.
+    #
+    # Cost — and this is what actually stalled the crawl. `ORDER BY priority,
+    # repo_score` cannot use the `repos_score` index once a million rows share
+    # one priority, so selection degenerated into a full scan of `repos` plus a
+    # temp B-tree: 8.5 seconds per batch of 120, during which nothing is
+    # fetched. A floor keeps the candidate set small enough for the queue's own
+    # (priority, enqueued_at) index to answer.
+    min_priority = int(os.getenv("SKILL_ENGINE_MIN_PRIORITY", "0"))
     shard = int(os.getenv("SKILL_ENGINE_SHARD", "0"))
     shards = max(1, int(os.getenv("SKILL_ENGINE_SHARDS", "1")))
 
@@ -348,6 +363,20 @@ async def run_tarball_crawl(
         max_bytes=max_mb * 1024 * 1024,
         min_delay=float(os.getenv("SKILL_ENGINE_MIN_DELAY", "0.15")),
     )
+    # Prune entries for repositories already harvested. `dequeue` runs on a
+    # successful harvest, but anything that marks `tree_sha` by another path
+    # leaves its queue row behind — and those rows accumulated to 1,174,482 of
+    # 2,317,996, so every batch selection filtered a million dead rows one at a
+    # time. Selection had degraded to 8.5 seconds per batch of 120.
+    pruned = store.db.execute(
+        "DELETE FROM queue WHERE full_name IN ("
+        "  SELECT q.full_name FROM queue q JOIN repos r ON r.full_name = q.full_name"
+        "  WHERE r.tree_sha IS NOT NULL)"
+    ).rowcount
+    if pruned:
+        store.commit()
+        log.info("Pruned %d already-harvested entries from the queue", pruned)
+
     totals = {"repos": 0, "skills": 0, "empty": 0, "fallback": 0, "errors": 0}
     started = time.time()
     since_rerank = 0
@@ -361,6 +390,7 @@ async def run_tarball_crawl(
                 FROM queue q
                 JOIN repos r ON r.full_name = q.full_name
                 WHERE q.attempts < 4
+                  AND q.priority >= ?
                   AND r.tree_sha IS NULL
                   AND COALESCE(r.size_kb, 0) <= ?
                   AND COALESCE(r.size_kb, 0) >= ?
@@ -379,7 +409,8 @@ async def run_tarball_crawl(
                 ORDER BY q.priority DESC, r.repo_score DESC
                 LIMIT ?
                 """,
-                (max_mb * 1024, min_kb, shards, shards, shard, batch),
+                (min_priority, max_mb * 1024, min_kb,
+                 shards, shards, shard, batch),
             ).fetchall()
             if not rows:
                 log.info("queue drained for the tarball path")
