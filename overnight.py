@@ -165,10 +165,25 @@ async def main() -> None:
             stalled,
         )
 
-    try:
-        recompute(store)
-    except Exception as exc:
-        log.warning("Final ranking pass failed: %s", exc)
+    # Gated by the same switch as the in-sweep rerank. This pass rewrites every
+    # row in `repos` and `skills` — 2.8M and 4.18M respectively — which is
+    # pointless while crawling, because `release.py` ranks once from the
+    # finished corpus and a mid-crawl ordering only decides what is swept next.
+    #
+    # Left ungated it was the real cause of a 33.7 GB write-ahead log: run
+    # hourly by the maintenance loop, each pass spent ~an hour rewriting seven
+    # million rows, holding one connection throughout so SQLite could never
+    # checkpoint. The sweep itself had finished in 0.1 minutes with nothing to
+    # do. An identical gate was added inside `run_tarball_crawl` earlier and
+    # this second call site was missed — the log line "skipping final rerank"
+    # came from the other one, which is exactly why it looked handled.
+    if int(os.getenv("SKILL_ENGINE_RERANK_EVERY", "2000")) < 1_000_000:
+        try:
+            recompute(store)
+        except Exception as exc:
+            log.warning("Final ranking pass failed: %s", exc)
+    else:
+        log.info("Skipping the final ranking pass; release.py ranks the corpus")
 
     skills, queued = get_counts(store)
     valid = store.db.execute("SELECT COUNT(*) c FROM skills WHERE valid=1").fetchone()["c"]
