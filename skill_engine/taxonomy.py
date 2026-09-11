@@ -1,42 +1,9 @@
-"""A browsable subject taxonomy for the skill corpus.
+"""Browsable subject taxonomy and IDF-weighted classification engine for agent skills.
 
-Search answers "I know what I want". A directory answers "show me what exists" —
-a different and, for a corpus nobody has seen before, often more useful
-question. This module provides the second.
-
-**Why rules and not a model.** Classifying 100,000 skills with an LLM would cost
-real money and take hours, and would have to be re-run on every crawl. The
-categories here are instead matched by weighted patterns over a skill's name,
-description, path and its repository's topics. That is deterministic, runs over
-the whole corpus in seconds, costs nothing, and — importantly for a directory —
-is *explainable*: you can always say why something landed where it did.
-
-The taxonomy itself was derived from the corpus rather than invented. Term
-frequencies over 95,725 skill names and descriptions surfaced the real clusters
-(review, design, api, analysis, audit, content, product, planning, security,
-mcp, research, architecture, testing), and the categories below follow them.
-
-**Scoring, and why it is IDF-weighted.** A skill accumulates weight per category
-from every pattern it matches, with the name weighted above the description
-because a skill's name is its most deliberate signal.
-
-Counting raw matches does not work, and the failure is instructive: it put
-**69.7% of the corpus into a single category**. No individual term was to blame
-— the most common, "agent", appears in under 10% of skills. The problem was
-that a category with twenty patterns simply has more chances to accumulate than
-one with eleven, so breadth beat relevance.
-
-Each pattern is therefore weighted by its inverse document frequency, measured
-against the corpus itself. A term appearing in 10% of skills contributes far
-less than one appearing in 0.1%, so "model context protocol" outweighs "agent",
-and categories are compared on the specificity of what they matched rather than
-on how many patterns their author happened to write.
-
-The best-scoring category becomes primary; every category clearing a floor is
-retained, since real skills often belong in two places. Anything matching
-nothing lands in `uncategorised` rather than being silently dropped — an honest
-directory shows its own gaps.
+Skills are classified into 16 primary domains and 80+ subcategories using deterministic,
+IDF-weighted pattern matching across skill name, description, file path, and repository topics.
 """
+
 
 from __future__ import annotations
 
@@ -517,3 +484,8 @@ def build_catalogue(store) -> dict:
     payload = {"categories": tree, "total": sum(c["count"] for c in tree)}
     store.put_meta("catalogue", _json.dumps(payload))
     return payload
+
+
+# Alias for American English compatibility
+categorize_corpus = categorise_corpus
+

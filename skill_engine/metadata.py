@@ -1,35 +1,4 @@
-"""Normalise repository metadata from GitHub's several differently-shaped sources.
-
-Three endpoints return "a repository" with different field sets and different
-names for the same thing:
-
-* **Repository search** (`/search/repositories`) — nearly the full REST shape,
-  and *free of core rate-limit cost* because search has its own bucket. This is
-  the single best metadata source for bulk discovery: 100 fully-populated repos
-  per request.
-* **The repo endpoint** (`/repos/{o}/{r}`) — adds `subscribers_count`, the real
-  watcher count, which search omits.
-* **GraphQL** — different names again (`stargazerCount`, `diskUsage`), but 100
-  repositories per request for ~1 point of a 5,000/hour budget.
-
-Everything funnels through `from_api_repo` / `from_graphql_repo` so the store
-and the ranker only ever see one vocabulary.
-
-### A note on "usage metrics"
-
-GitHub's API does **not** expose what people usually mean by usage:
-
-* **Dependents / "Used by"** is rendered in HTML only. There is no API for it.
-* **Traffic** (`/traffic/views`, `/traffic/clones`) requires *push* access, so
-  it is unavailable for repositories you do not own.
-* **Package downloads** exist only for repos publishing to a registry.
-
-What is available, and what the ranker therefore uses, are proxies: stars,
-forks, subscribers, open issues, contributor count, release cadence, and the
-*derivatives* of those over the repository's lifetime. `stars_per_day` and
-`fork_ratio` carry real signal precisely because they are ratios the raw counts
-cannot express.
-"""
+"""Normalizes repository metadata across GitHub REST, GraphQL, and search endpoints."""
 
 from __future__ import annotations
 
@@ -38,10 +7,19 @@ from typing import Any
 
 
 def _iso(value: Any) -> str | None:
+    """Validates and returns ISO datetime string or None."""
     return value if isinstance(value, str) and value else None
 
 
 def days_since(iso: str | None) -> float | None:
+    """Calculates floating-point days elapsed since an ISO timestamp.
+
+    Args:
+        iso: ISO 8601 formatted datetime string.
+
+    Returns:
+        Elapsed days as float, or None if input is invalid.
+    """
     if not iso:
         return None
     try:
@@ -53,8 +31,16 @@ def days_since(iso: str | None) -> float | None:
     return max(0.0, (datetime.now(timezone.utc) - when).total_seconds() / 86400.0)
 
 
-def from_api_repo(item: dict, *, discovered_via: str = "") -> dict:
-    """Map a REST repository object (search item or full repo) to our schema."""
+def from_api_repo(item: dict, *, discovered_via: str = "") -> dict[str, Any]:
+    """Maps a REST repository payload (search hit or /repos endpoint) to the internal schema.
+
+    Args:
+        item: Raw repository dictionary from GitHub REST API.
+        discovered_via: Label indicating the discovery source.
+
+    Returns:
+        Normalized repository metadata dictionary.
+    """
     lic = item.get("license") or {}
     spdx = lic.get("spdx_id") if isinstance(lic, dict) else None
     owner = item.get("owner") or {}
@@ -84,8 +70,6 @@ def from_api_repo(item: dict, *, discovered_via: str = "") -> dict:
         "has_pages": bool(item.get("has_pages")),
         "has_discussions": bool(item.get("has_discussions")),
     }
-    # Only the full repo endpoint carries the true watcher count; search does
-    # not, and `watchers_count` there is an alias of stars, so it is useless.
     if "subscribers_count" in item:
         meta["subscribers"] = item["subscribers_count"]
     if discovered_via:
@@ -93,8 +77,16 @@ def from_api_repo(item: dict, *, discovered_via: str = "") -> dict:
     return meta
 
 
-def from_graphql_repo(node: dict, *, discovered_via: str = "") -> dict:
-    """Map a GraphQL repository node to our schema."""
+def from_graphql_repo(node: dict, *, discovered_via: str = "") -> dict[str, Any]:
+    """Maps a GitHub GraphQL repository node to the internal schema.
+
+    Args:
+        node: Raw GraphQL node dictionary.
+        discovered_via: Label indicating the discovery source.
+
+    Returns:
+        Normalized repository metadata dictionary.
+    """
     lic = (node.get("licenseInfo") or {}).get("spdxId")
     topics = [
         n["topic"]["name"]
@@ -102,11 +94,12 @@ def from_graphql_repo(node: dict, *, discovered_via: str = "") -> dict:
         if n.get("topic")
     ]
     releases = node.get("releases") or {}
-    latest = (releases.get("nodes") or [{}])
-    meta = {
+    latest = releases.get("nodes") or [{}]
+    meta: dict[str, Any] = {
         "full_name": node["nameWithOwner"],
-        "owner_type": "Organization" if (node.get("owner") or {}).get(
-            "__typename") == "Organization" else "User",
+        "owner_type": "Organization"
+        if (node.get("owner") or {}).get("__typename") == "Organization"
+        else "User",
         "default_branch": (node.get("defaultBranchRef") or {}).get("name") or "main",
         "description": node.get("description"),
         "homepage": node.get("homepageUrl") or None,

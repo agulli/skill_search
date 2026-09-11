@@ -1,22 +1,5 @@
-"""HTTP layer: a JSON API and a search UI, on the standard library only.
+"""HTTP serving layer: provides JSON REST API endpoints and web search interface."""
 
-Two things matter at 100k skills that did not at 100.
-
-**Connection reuse.** The first version opened a fresh `Store` per request,
-which re-ran the schema script and the migration check against a 2.5GB database
-every time — that alone was most of a 2-second response. Connections are now
-cached per thread (SQLite objects are not safe to share across threads, and
-`ThreadingHTTPServer` runs handlers on many), which drops a query to well under
-a tenth of a second.
-
-**Filtering.** Twenty results out of a corpus this size is a lucky dip. The UI
-is built around facets computed from the matched set — kind, licence, language —
-plus quality, popularity and freshness thresholds, so the corpus is navigable
-rather than merely searchable.
-
-If you later want auth, CORS policy, or OpenAPI, swap this module for FastAPI
-without touching anything else: `search.search()` is the seam.
-"""
 
 from __future__ import annotations
 

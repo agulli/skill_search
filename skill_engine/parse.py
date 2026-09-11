@@ -1,21 +1,14 @@
-"""Parse and validate a SKILL.md file.
+"""Parser and validation engine for SKILL.md agent skill specifications.
 
-The Agent Skills format is a Markdown file opening with a YAML frontmatter
-block. `name` and `description` are required; everything else is optional and
-varies by runtime.
+Agent skills are markdown documents initiated with a YAML frontmatter block.
+The `name` and `description` fields are mandatory; all additional fields are
+optional and vary across agent runtimes (Google Antigravity, Gemini, Claude, Cursor).
 
-Validation is split into two tiers, and the split matters. **Hard problems**
-mean the file is not a skill at all — no frontmatter, no name, no description,
-unparseable YAML — and those are excluded from search. **Soft warnings** mean
-the file is a real skill that bends the spec: a description over the 1024-char
-limit, a name that is not a clean slug, a thin body. Those stay indexed and
-lose points instead.
-
-The distinction is not pedantry. Enforcing the letter of the spec as an
-admission test silently drops genuinely useful skills — including first-party
-ones that run past the description limit — and a search engine that cannot
-find real, working skills has failed at its only job. Unknown keys are kept
-verbatim so the index survives additions to the spec.
+Validation follows a two-tier model:
+- Hard Errors: Structural defects that prevent indexing (e.g. absent frontmatter,
+  missing required fields, unparseable YAML, empty body).
+- Soft Warnings: Deviations from standard conventions (e.g. descriptions >1,024 chars,
+  non-slug names). These files remain indexed with minor ranking score penalties.
 """
 
 from __future__ import annotations
@@ -29,7 +22,7 @@ import yaml
 
 from .config import SKILL_DIR_PREFIXES
 
-# Skill names are directory-safe slugs: lowercase alphanumerics and hyphens.
+# Skill names should follow lowercase alphanumeric slug conventions
 NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 NAME_MAX = 64
 DESCRIPTION_MAX = 1024
@@ -39,13 +32,14 @@ FRONTMATTER_RE = re.compile(
     re.DOTALL,
 )
 
-# Links to bundled resources: the spec's progressive-disclosure pattern, where
-# SKILL.md points at scripts/ and references/ loaded only when needed.
+# Relative links to bundled resources (scripts/, references/, assets/)
 RESOURCE_RE = re.compile(r"(?:\]\(|[`'\"])((?:\./)?(?:scripts|references|assets)/[^)`'\"\s]+)")
 
 
 @dataclass
 class ParsedSkill:
+    """Represents a parsed and validated agent skill."""
+
     name: str = ""
     description: str = ""
     version: str | None = None
@@ -61,29 +55,34 @@ class ParsedSkill:
     content_hash: str = ""
 
     valid: bool = False
-    problems: list[str] = field(default_factory=list)   # hard: not a skill
-    warnings: list[str] = field(default_factory=list)   # soft: a flawed skill
+    problems: list[str] = field(default_factory=list)  # Hard validation errors
+    warnings: list[str] = field(default_factory=list)  # Soft validation warnings
 
     @property
     def invalid_reason(self) -> str:
+        """Returns concatenated hard failure reasons."""
         return "; ".join(self.problems)
 
     @property
     def notes(self) -> str:
+        """Returns concatenated soft warning notes."""
         return "; ".join(self.warnings)
 
 
 def classify_path(path: str) -> str:
-    """Where in the repo this skill lives — a decent proxy for how it is used."""
+    """Classifies the relative repository location of a skill file.
+
+    Args:
+        path: Relative file path in the repository (e.g., 'skills/pdf/SKILL.md').
+
+    Returns:
+        String classification label representing the source directory convention.
+    """
     lowered = path.lower()
     if "/" not in path:
         return "root"
-    # A plugin bundles skills under plugins/<name>/skills/<skill>/, so it has to
-    # be tested before the bare skills/ prefix that it also contains.
     if lowered.startswith("plugins/") or "/plugins/" in lowered:
         return "plugin"
-    # Longest prefix first: ".claude/skills/" also ends with "skills/", and the
-    # more specific match is the informative one.
     for prefix in sorted(SKILL_DIR_PREFIXES, key=len, reverse=True):
         if lowered.startswith(prefix) or f"/{prefix}" in lowered:
             return SKILL_DIR_PREFIXES[prefix]
@@ -91,12 +90,28 @@ def classify_path(path: str) -> str:
 
 
 def skill_slug_from_path(path: str) -> str:
-    """The directory a skill lives in is its de facto name when frontmatter lies."""
+    """Extracts the parent directory name as a fallback slug.
+
+    Args:
+        path: File path string.
+
+    Returns:
+        Extracted slug or empty string.
+    """
     parts = path.split("/")
     return parts[-2] if len(parts) >= 2 else ""
 
 
 def parse_skill(text: str, path: str = "") -> ParsedSkill:
+    """Parses markdown content and validates frontmatter attributes.
+
+    Args:
+        text: Raw text of the SKILL.md file.
+        path: Optional file path within repository for context.
+
+    Returns:
+        ParsedSkill instance populated with validation results and metadata.
+    """
     out = ParsedSkill()
     out.content_hash = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
 
@@ -127,34 +142,33 @@ def parse_skill(text: str, path: str = "") -> ParsedSkill:
         out.problems.append("frontmatter is not a mapping")
         return out
 
-    # Normalise the two spellings runtimes accept for the same field.
+    # Normalize underscore and hyphen keys across different agent runtimes
     meta = {str(k).strip(): v for k, v in meta.items()}
-    normalised = {k.replace("_", "-"): v for k, v in meta.items()}
+    normalized = {k.replace("_", "-"): v for k, v in meta.items()}
 
-    name = normalised.get("name")
+    name = normalized.get("name")
     out.name = str(name).strip() if isinstance(name, (str, int)) else ""
-    description = normalised.get("description")
+    description = normalized.get("description")
     out.description = str(description).strip() if isinstance(description, (str, int)) else ""
 
-    version = normalised.get("version")
+    version = normalized.get("version")
     out.version = str(version).strip() if version is not None else None
-    lic = normalised.get("license")
+    lic = normalized.get("license")
     out.license = str(lic).strip() if isinstance(lic, str) else None
 
-    tools = normalised.get("allowed-tools")
+    tools = normalized.get("allowed-tools")
     if isinstance(tools, str):
         out.allowed_tools = [t.strip() for t in tools.split(",") if t.strip()]
     elif isinstance(tools, list):
         out.allowed_tools = [str(t).strip() for t in tools if str(t).strip()]
 
-    md = normalised.get("metadata")
+    md = normalized.get("metadata")
     out.metadata = md if isinstance(md, dict) else {}
 
     known = {"name", "description", "version", "license", "allowed-tools", "metadata"}
-    out.extra = {k: v for k, v in normalised.items() if k not in known}
+    out.extra = {k: v for k, v in normalized.items() if k not in known}
 
-    # --- validation -------------------------------------------------------
-    # Hard: the required fields are absent, so this is not a skill.
+    # Hard validation checks
     if not out.name:
         out.problems.append("missing name")
     if not out.description:
@@ -162,7 +176,7 @@ def parse_skill(text: str, path: str = "") -> ParsedSkill:
     if out.body_len < 40:
         out.problems.append("body is essentially empty")
 
-    # Soft: present but out of spec. Still a skill; just a scruffier one.
+    # Soft validation checks
     if out.name and len(out.name) > NAME_MAX:
         out.warnings.append(f"name longer than {NAME_MAX} chars")
     if out.name and not NAME_RE.match(out.name):
@@ -184,17 +198,26 @@ def quality_score(
     days_since_push: float = 9999.0,
     duplicate_count: int = 0,
 ) -> float:
-    """A 0–100 ranking prior, blended into search scores.
+    """Computes a baseline quality prior score (0-100) for search ranking.
 
-    Popularity is logarithmic so a 40k-star monorepo does not bury a focused
-    300-star skill collection. Everything else is a small nudge.
+    Args:
+        skill: ParsedSkill instance.
+        stars: Repository star count.
+        is_fork: Whether the repository is a fork.
+        archived: Whether the repository is archived.
+        has_license: Whether a repository-level license is detected.
+        days_since_push: Elapsed days since latest repository push.
+        duplicate_count: Total identical copies detected across corpus.
+
+    Returns:
+        Float quality score bounded between 0.0 and 100.0.
     """
     import math
 
     score = 0.0
-    score += min(35.0, 9.0 * math.log10(max(stars, 0) + 1))  # 35 pts at ~7k stars
+    score += min(35.0, 9.0 * math.log10(max(stars, 0) + 1))
 
-    # Craft signals: a description in the useful band, real prose, bundled files.
+    # Craft signals: description length, body depth, resources, tools, and license
     dlen = len(skill.description)
     if 40 <= dlen <= 600:
         score += 12.0
@@ -211,17 +234,16 @@ def quality_score(
     if has_license or skill.license:
         score += 6.0
 
-    # Freshness, decaying over roughly a year.
+    # Recency decay curve
     score += 14.0 * math.exp(-days_since_push / 240.0)
 
-    # Spec deviations cost points rather than an index entry.
+    # Soft warning penalties
     score -= 4.0 * len(skill.warnings)
 
     if is_fork:
         score -= 12.0
     if archived:
         score -= 10.0
-    # A file copied verbatim into many repos is usually a vendored template.
     if duplicate_count > 1:
         score -= min(15.0, 3.0 * math.log2(duplicate_count + 1))
 

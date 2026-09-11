@@ -1,23 +1,5 @@
-"""Quota-free harvesting via codeload tarballs.
+"""High-throughput archive streaming crawler using codeload.github.com."""
 
-The REST path costs one core request per repository for the tree listing, which
-caps an unauthenticated crawler at ~30 repos/hour and a single-token crawler at
-~5,000/hour. `codeload.github.com` is not part of the REST API and does not draw
-on that budget at all: one download returns every file in the repository,
-including every `SKILL.md`, for zero quota.
-
-Combined with the fact that repository search already gave us complete metadata
-(default branch included), a tarball harvest needs **no API requests
-whatsoever**. Throughput stops being quota-bound and becomes bandwidth-bound,
-which is a difference of two orders of magnitude.
-
-The trade is that we download the whole repository to read a handful of files,
-so this path is chosen by size: `size_kb` is known for every repo before we
-fetch anything, and oversized ones fall back to the tree API. Downloads are
-capped, streamed rather than buffered, and deliberately limited in concurrency —
-this endpoint is a courtesy, not an entitlement, and hammering it is how you
-lose access to it.
-"""
 
 from __future__ import annotations
 

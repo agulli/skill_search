@@ -1,16 +1,4 @@
-"""Optional dense embeddings for semantic recall.
-
-BM25 alone is a genuinely strong baseline for this corpus — skill descriptions
-are short, keyword-dense, and written to be matched — so embeddings are opt-in
-rather than assumed. When they help is when an agent queries in its own words
-("read a spreadsheet and chart it") against a skill that says "xlsx analysis
-and visualisation".
-
-Anthropic does not serve an embeddings endpoint; Voyage AI is the recommended
-provider, and a local sentence-transformers model costs nothing to run. Both
-are wired here behind one interface, along with a zero-dependency hashing
-vectoriser useful for testing the plumbing without spending anything.
-"""
+"""Dense embedding backends for semantic recall and hybrid search."""
 
 from __future__ import annotations
 
@@ -28,6 +16,8 @@ TOKEN_RE = re.compile(r"[a-z0-9][a-z0-9_+-]{1,}")
 
 
 class Embedder(Protocol):
+    """Protocol interface for embedding models."""
+
     model: str
     dim: int
 
@@ -35,14 +25,25 @@ class Embedder(Protocol):
 
 
 def pack(vec: list[float]) -> bytes:
+    """Packs a floating-point vector into binary format."""
     return struct.pack(f"<{len(vec)}f", *vec)
 
 
 def unpack(blob: bytes) -> list[float]:
+    """Unpacks binary data into a list of floats."""
     return list(struct.unpack(f"<{len(blob) // 4}f", blob))
 
 
 def cosine(a: list[float], b: list[float]) -> float:
+    """Computes cosine similarity between two float vectors.
+
+    Args:
+        a: First vector.
+        b: Second vector.
+
+    Returns:
+        Float cosine similarity between -1.0 and 1.0.
+    """
     if not a or not b or len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
@@ -52,13 +53,7 @@ def cosine(a: list[float], b: list[float]) -> float:
 
 
 class HashingEmbedder:
-    """Deterministic, dependency-free, free to run.
-
-    A hashed bag-of-words with sublinear term weighting. It is *not* semantic —
-    it will not connect "spreadsheet" to "xlsx" — but it exercises the whole
-    vector path end to end, which makes it the right default for tests and for
-    proving out the pipeline before paying for a real model.
-    """
+    """Deterministic hashing-based bag-of-words vectorizer for testing and pipelines."""
 
     def __init__(self, dim: int = 512) -> None:
         self.dim = dim
@@ -83,10 +78,10 @@ class HashingEmbedder:
 
 
 class VoyageEmbedder:
-    """Voyage AI — the embeddings provider Anthropic recommends alongside Claude."""
+    """Voyage AI cloud embedding backend."""
 
     def __init__(self, model: str = "voyage-3.5", api_key: str | None = None) -> None:
-        import voyageai  # optional dependency
+        import voyageai  # Optional dependency
 
         self.client = voyageai.Client(api_key=api_key or os.getenv("VOYAGE_API_KEY"))
         self.model = model
@@ -94,7 +89,7 @@ class VoyageEmbedder:
 
     def encode(self, texts: list[str]) -> list[list[float]]:
         vectors: list[list[float]] = []
-        for i in range(0, len(texts), 128):  # Voyage caps batch size
+        for i in range(0, len(texts), 128):
             chunk = texts[i : i + 128]
             resp = self.client.embed(chunk, model=self.model, input_type="document")
             vectors.extend(resp.embeddings)
@@ -108,10 +103,10 @@ class VoyageEmbedder:
 
 
 class LocalEmbedder:
-    """sentence-transformers on the CPU: no API key, no per-call cost."""
+    """Local CPU sentence-transformers embedding backend."""
 
     def __init__(self, model: str = "sentence-transformers/all-MiniLM-L6-v2") -> None:
-        from sentence_transformers import SentenceTransformer  # optional dependency
+        from sentence_transformers import SentenceTransformer  # Optional dependency
 
         self.st = SentenceTransformer(model)
         self.model = model
@@ -122,6 +117,14 @@ class LocalEmbedder:
 
 
 def build(name: str) -> Embedder | None:
+    """Builds an Embedder instance by configuration name.
+
+    Args:
+        name: Name of embedder ("none", "hashing", "local", "voyage").
+
+    Returns:
+        Embedder instance or None if disabled.
+    """
     name = (name or "none").lower()
     if name in ("none", "off", ""):
         return None
@@ -131,16 +134,11 @@ def build(name: str) -> Embedder | None:
         return VoyageEmbedder()
     if name in ("local", "minilm", "sentence-transformers"):
         return LocalEmbedder()
-    raise ValueError(f"unknown embedder: {name}")
+    raise ValueError(f"Unknown embedder: {name}")
 
 
 def embed_text(name: str, description: str, body: str, repo: str) -> str:
-    """What actually gets embedded.
-
-    Weighted towards the fields that describe intent. The body is truncated
-    because a skill's opening paragraphs carry its purpose; the rest is
-    procedure, which dilutes the vector.
-    """
+    """Constructs representative text representation for semantic embedding."""
     return "\n".join([
         f"{name}",
         f"{description}",

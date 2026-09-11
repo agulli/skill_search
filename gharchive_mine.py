@@ -1,53 +1,73 @@
 #!/usr/bin/env python
-"""Bulk discovery from GH Archive — free, and not rate-limited.
+"""Bulk candidate repository discovery from GH Archive event streams.
 
-Repository search is capped at 10 requests/minute unauthenticated, which makes
-it the binding constraint on how fast the corpus can grow. GH Archive has no
-such limit: it publishes hourly dumps of every public GitHub event, and each
-hour names tens of thousands of distinct repositories.
+This script streams public hourly GitHub event dumps from data.gharchive.org to
+identify newly created, pushed, or starred repositories containing agent skills.
+Candidate discovery via GH Archive consumes zero GitHub REST API quota.
 
-Filtering those names for skill-related tokens costs nothing but bandwidth and
-CPU, and runs alongside both the search-driven discovery and the harvest without
-competing with either. A name match is only a candidate — the harvest confirms
-it — but confirming is exactly what the tarball path already does for free.
-
-    python gharchive_mine.py data/scale.db 48      # mine the last 48 hours
+Usage:
+    python gharchive_mine.py data/scale.db 48      # Mine candidate events from last 48 hours
 """
-import asyncio, gzip, io, json, logging, os, sys, time
+
+from __future__ import annotations
+
+import asyncio
+import gzip
+import io
+import json
+import logging
+import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import httpx
 
 from skill_engine.config import USER_AGENT
 from skill_engine.store import Store
 
+if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+    print(__doc__.strip())
+    sys.exit(0)
+
 DB = sys.argv[1] if len(sys.argv) > 1 else "data/scale.db"
 HOURS = int(sys.argv[2]) if len(sys.argv) > 2 else 48
-# Hours to skip before starting, so the history can be sharded across several
-# processes that do not re-download each other's files. The job is bandwidth-
-# and CPU-bound per process, so N shards over disjoint windows is close to N
-# times the throughput — the only way a 90-day sweep finishes in one night.
 SKIP = int(sys.argv[3]) if len(sys.argv) > 3 else 0
 CONCURRENCY = int(os.getenv("GHARCHIVE_CONCURRENCY", "3"))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s A %(message)s",
-                    datefmt="%H:%M:%S")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 log = logging.getLogger("gharchive")
 
-# Tokens that make a bare repository name worth a confirmation fetch. Broader
-# than the crawler's live filter because here a false positive costs one
-# quota-free tarball, not an API request.
-HINTS = ("skill", "agent", "claude", "mcp", "prompt", "llm", "anthropic",
-         "copilot", "cursor", "openclaw", "subagent", "ai-tool", "aiagent")
-INTERESTING = {"PushEvent", "CreateEvent", "ReleaseEvent", "PublicEvent",
-               "ForkEvent", "WatchEvent"}
+# Keywords matching candidate skill repositories
+HINTS = (
+    "skill", "skills", "agent", "agents", "gemini", "antigravity", "claude", "mcp",
+    "prompt", "llm", "anthropic", "copilot", "cursor", "openclaw", "subagent",
+    "ai-tool", "aiagent", "google-genai",
+)
+
+INTERESTING_EVENTS = {
+    "PushEvent", "CreateEvent", "ReleaseEvent", "PublicEvent",
+    "ForkEvent", "WatchEvent",
+}
 
 
-async def mine_hour(client, ts, seen, lock, stats):
-    url = (f"https://data.gharchive.org/{ts.year:04d}-{ts.month:02d}-"
-           f"{ts.day:02d}-{ts.hour}.json.gz")
+async def mine_hour(
+    client: httpx.AsyncClient,
+    ts: datetime,
+    seen: set[str],
+    lock: asyncio.Lock,
+    stats: dict[str, Any],
+) -> list[str]:
+    """Downloads and filters one hourly archive file."""
+    url = f"https://data.gharchive.org/{ts.year:04d}-{ts.month:02d}-{ts.day:02d}-{ts.hour}.json.gz"
     try:
         resp = await client.get(url)
         if resp.status_code != 200:
@@ -57,14 +77,15 @@ async def mine_hour(client, ts, seen, lock, stats):
         log.warning("%s: %s", url.rsplit("/", 1)[-1], type(exc).__name__)
         return []
 
-    found, total = [], 0
+    found: list[str] = []
+    total = 0
     for line in io.BytesIO(raw):
         try:
             event = json.loads(line)
         except Exception:
             continue
         total += 1
-        if event.get("type") not in INTERESTING:
+        if event.get("type") not in INTERESTING_EVENTS:
             continue
         name = (event.get("repo") or {}).get("name")
         if not name:
@@ -77,49 +98,53 @@ async def mine_hour(client, ts, seen, lock, stats):
                     found.append(name)
     stats["events"] += total
     stats["bytes"] += len(resp.content)
-    log.info("%s: %d events -> %d new candidates",
-             url.rsplit("/", 1)[-1], total, len(found))
+    log.info("%s: %d events -> %d new candidates", url.rsplit("/", 1)[-1], total, len(found))
     return found
 
 
-async def main():
+async def main() -> None:
     store = Store(Path(DB))
     seen = {r["full_name"] for r in store.db.execute("SELECT full_name FROM repos")}
-    log.info("mining %d hours from -%dh; %d repos already known",
-             HOURS, SKIP, len(seen))
+    log.info(
+        "Mining %d hours (offset: -%dh); %d repositories already indexed",
+        HOURS, SKIP, len(seen),
+    )
 
     lock = asyncio.Lock()
     stats = {"events": 0, "bytes": 0}
     added = 0
-    now = datetime.now(timezone.utc) - timedelta(hours=2)   # publishing lag
+    now = datetime.now(timezone.utc) - timedelta(hours=2)
     sem = asyncio.Semaphore(CONCURRENCY)
 
-    async with httpx.AsyncClient(timeout=180.0, follow_redirects=True,
-                                 headers={"User-Agent": USER_AGENT}) as client:
-        async def one(offset):
+    async with httpx.AsyncClient(
+        timeout=180.0,
+        follow_redirects=True,
+        headers={"User-Agent": USER_AGENT},
+    ) as client:
+        async def one(offset: int) -> list[str]:
             async with sem:
-                return await mine_hour(client, now - timedelta(hours=offset),
-                                       seen, lock, stats)
+                return await mine_hour(client, now - timedelta(hours=offset), seen, lock, stats)
 
         for chunk_start in range(SKIP, SKIP + HOURS, CONCURRENCY * 2):
-            offsets = range(chunk_start,
-                            min(chunk_start + CONCURRENCY * 2, SKIP + HOURS))
+            offsets = range(chunk_start, min(chunk_start + CONCURRENCY * 2, SKIP + HOURS))
             for names in await asyncio.gather(*(one(o) for o in offsets)):
                 for name in names:
-                    # Low priority: these are name-matched guesses, so they
-                    # queue behind anything search actually confirmed.
-                    # A queue entry with no repos row is invisible to the
-                    # sweep, which joins the two — so create the stub first.
                     store.ensure_repo_stub(name, "gharchive-mine")
                     store.enqueue(name, "gharchive-mine", 60)
                     added += 1
             store.commit()
-            log.info("running total: +%d candidates, %.1fGB read, %d events",
-                     added, stats["bytes"] / 1e9, stats["events"])
+            log.info(
+                "Progress: +%d candidates | %.1f GB processed | %d total events",
+                added, stats["bytes"] / 1e9, stats["events"],
+            )
 
     store.commit()
-    log.info("DONE: +%d candidates from %d events (%.1fGB), 0 API requests",
-             added, stats["events"], stats["bytes"] / 1e9)
+    log.info(
+        "Complete: +%d candidate repositories identified from %d events (%.1f GB)",
+        added, stats["events"], stats["bytes"] / 1e9,
+    )
     store.close()
 
-asyncio.run(main())
+
+if __name__ == "__main__":
+    asyncio.run(main())

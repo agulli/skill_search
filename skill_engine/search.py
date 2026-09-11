@@ -1,27 +1,11 @@
-"""Hybrid retrieval: BM25 over FTS5, fused with optional vector similarity.
+"""Hybrid retrieval engine: combines BM25 full-text search with optional dense vector similarity and quality priors.
 
-Ranking is three signals combined:
-
-1. **BM25** from SQLite's FTS5, with per-column weights — a query term matching
-   a skill's `name` means far more than the same term buried in its body.
-2. **Vector cosine**, when embeddings are enabled, for queries phrased
-   differently from the skill's own vocabulary.
-3. **A quality prior** from `parse.quality_score` — stars, freshness, licence,
-   whether the frontmatter validates.
-
-BM25 and vector scores live on incomparable scales, so we fuse them with
-weighted Reciprocal Rank Fusion rather than trying to normalise and add them.
-RRF only looks at rank position, which makes it robust to exactly the scale
-mismatch that breaks naive weighted sums.
-
-Crucially, quality goes into the *same* fusion as a third ranked list rather
-than being blended in afterwards as a 0–1 number. Mixing the two spaces does
-not work: RRF scores are compressed (with k=60, first place beats second by
-1.6%), so any prior on a full 0–1 scale silently overrules the retrievers and
-you end up ranking by popularity with a search box attached. Ranking the
-candidates by quality and fusing that list keeps every signal in rank space,
-where the weights mean what they say.
+Ranking fuses multiple retrieval channels via weighted Reciprocal Rank Fusion (RRF):
+1. FTS5 BM25 with column-specific weighting (name, description, body, repo, path)
+2. Dense vector cosine similarity (when embeddings are enabled)
+3. Corpus-calibrated quality score prior
 """
+
 
 from __future__ import annotations
 

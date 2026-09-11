@@ -1,11 +1,5 @@
-"""SQLite storage: repositories, skills, an FTS5 index, ETags, and a work queue.
+"""SQLite persistence layer: manages repositories, skills, FTS5 index, ETags, and prioritized queues."""
 
-SQLite is a deliberate choice, not a placeholder. The whole corpus of public
-agent skills is currently in the tens of thousands of documents — FTS5 handles
-that with BM25 ranking in single-digit milliseconds, in one file, with no
-server. The schema maps cleanly onto Postgres + tsvector if the corpus ever
-outgrows it.
-"""
 
 from __future__ import annotations
 

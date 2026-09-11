@@ -1,23 +1,5 @@
-"""Discovery: finding repositories that might contain agent skills.
+"""Multi-channel repository discovery engine: date-bisected search, awesome-lists, and event streams."""
 
-No single source is sufficient, and the obvious one is the weakest:
-
-* **Repository search** is the workhorse. It is capped at 1000 results per
-  query, which we defeat by recursively bisecting a `created:` date range until
-  every shard fits under the cap. This turns a 1000-result ceiling into
-  complete coverage of a query.
-* **Code search** finds skills in repos whose name and topics reveal nothing.
-  It is rate-limited hard (10 req/min) and also capped at 1000, so we treat it
-  as a seed source and shard it by repository size.
-* **Awesome-list mining** is the highest-yield source per request: one raw
-  README fetch can surface a few hundred curated repositories, and costs no API
-  quota at all.
-* **GH Archive** is how you stay fresh without polling. Hourly public-event
-  dumps let us notice a push to a repo we already index for free, and surface
-  brand-new repos whose names look promising.
-* **Owner expansion**: someone who published one skill collection usually
-  published more.
-"""
 
 from __future__ import annotations
 

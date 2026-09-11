@@ -1,23 +1,5 @@
-"""Skill sources beyond GitHub.
+"""Multi-forge ingestion connectors for GitLab and Hugging Face repositories."""
 
-GitHub holds most of the corpus, but not all of it, and a search engine that
-indexes one forge is really an index of that forge rather than of the subject.
-Two others carry enough agent skills to be worth crawling:
-
-* **GitLab** — public projects, same `SKILL.md` convention, and the same
-  archive trick: one tarball per project rather than a request per file.
-* **Hugging Face** — Spaces and models increasingly ship agent skills beside
-  the weights, and the Hub API lists every file in a repository for free.
-
-Both go through `parse_skill` and `upsert_skill`, exactly as the GitHub crawler
-does. That is the point rather than a convenience: content hashes must be
-computed identically or the same skill mirrored to two forges would count
-twice, and percentile normalisation — which is corpus-relative — would be
-scored against a population that is part real and part double-counted.
-
-Repositories are namespaced by host (`gitlab.com/group/project`) because
-`repos.full_name` is a primary key and `owner/name` collides across forges.
-"""
 
 from __future__ import annotations
 

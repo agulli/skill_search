@@ -1,39 +1,4 @@
-"""Author reputation: judging the person behind the skill.
-
-A skill's own file tells you how well-made it is. It cannot tell you whether
-the person who wrote it knows what they are doing, keeps things working, or
-merely copied someone else's work into a repository of their own. Across this
-corpus that last question matters enormously: **20% of all indexed skills are
-verbatim copies of another skill**, so "who published this" carries real
-information about whether it is worth trusting.
-
-Six signals make up an author's standing, and every one comes from data already
-in the corpus — no extra API calls:
-
-* **craft** — the median craft of everything they have published. The single
-  most direct evidence of ability.
-* **originality** — what fraction of their skills are not copies of someone
-  else's. This is the integrity signal, and the one nothing else captures.
-* **reach** — stars and forks across their whole portfolio, not one lucky repo.
-* **body of work** — how many skills, damped hard: quantity is weak evidence of
-  quality, and rewarding it linearly is how you promote bulk scrapers.
-* **consistency** — do they license and describe their repositories, or ship
-  bare dumps?
-* **tenure and upkeep** — how long they have been publishing, and whether the
-  work is still maintained.
-
-### Avoiding circularity
-
-Author standing feeds the skill score, so it must not be *built from* the skill
-score — that would be a feedback loop where popular authors inflate their own
-skills which inflate them further. It is built from `ranking.craft_score`
-instead, which judges a `SKILL.md` on its own contents and knows nothing about
-repositories or authors. The dependency graph stays acyclic: craft → author →
-skill.
-
-`followers` is the one signal worth an API call, and it is optional: absent, its
-weight is redistributed rather than counted as zero.
-"""
+"""Author reputation model: aggregates developer portfolio signals and integrity metrics."""
 
 from __future__ import annotations
 
@@ -75,17 +40,18 @@ CREATE TABLE IF NOT EXISTS authors (
 CREATE INDEX IF NOT EXISTS authors_score ON authors(author_score DESC);
 """
 
-# Percentile-normalised author metrics, on the same principle as the repo ones.
+# Quantiles for author-level aggregate metrics
 AUTHOR_METRICS = ("author_stars", "author_skills", "author_followers")
 
 
-def ensure_schema(store) -> None:
+def ensure_schema(store: Any) -> None:
+    """Ensures authors table and indexes exist."""
     store.db.executescript(SCHEMA)
     store.db.commit()
 
 
-def build_profiles(store, stats: CorpusStats) -> int:
-    """Aggregate every owner's corpus footprint into the `authors` table."""
+def build_profiles(store: Any, stats: CorpusStats) -> int:
+    """Aggregates all repository and skill data by author login."""
     ensure_schema(store)
 
     repos: dict[str, list[Any]] = {}
@@ -111,7 +77,7 @@ def build_profiles(store, stats: CorpusStats) -> int:
     for owner, owned in repos.items():
         with_skills = [r for r in owned if (r["skill_count"] or 0) > 0]
         if not with_skills and owner not in totals:
-            continue  # nothing published: not an author of skills
+            continue
 
         created = [r["created_at"] for r in owned if r["created_at"]]
         pushed = [r["pushed_at"] for r in owned if r["pushed_at"]]
@@ -158,8 +124,8 @@ def build_profiles(store, stats: CorpusStats) -> int:
     return len(rows)
 
 
-def author_quantiles(store) -> dict[str, list[float]]:
-    """Quantiles for author-scale metrics, which have their own distribution."""
+def author_quantiles(store: Any) -> dict[str, list[float]]:
+    """Derives empirical percentile distributions across all profiled authors."""
     samples: dict[str, list[float]] = {m: [] for m in AUTHOR_METRICS}
     for r in store.db.execute(
         "SELECT total_stars, skills, followers FROM authors WHERE skills > 0"
@@ -181,13 +147,10 @@ def author_quantiles(store) -> dict[str, list[float]]:
     return out
 
 
-def score_author(row: Any, stats: CorpusStats) -> tuple[float, dict]:
-    """An author's standing, 0–100, with an explainable breakdown."""
+def score_author(row: Any, stats: CorpusStats) -> tuple[float, dict[str, Any]]:
+    """Computes composite author standing score (0-100) with diagnostic breakdown."""
     skills = row["skills"] or 0
     originality = (row["original_skills"] / skills) if skills else None
-
-    # Damped hard on purpose: publishing 400 skills is not 40x the evidence of
-    # publishing 10, and treating it that way rewards bulk copying.
     body_of_work = min(1.0, math.log10(skills + 1) / 2.0) if skills else 0.0
 
     consistency, cons_detail = blend([
@@ -200,7 +163,6 @@ def score_author(row: Any, stats: CorpusStats) -> tuple[float, dict]:
     longevity = None if tenure_days is None else min(1.0, tenure_days / 540.0)
 
     value, detail = blend([
-        # Craft is the most direct evidence of ability, so it carries the most.
         ("craft", row["median_craft"], 0.30),
         ("originality", originality, 0.22),
         ("reach", stats.pct("author_stars", row["total_stars"]), 0.16),
@@ -228,42 +190,37 @@ def score_author(row: Any, stats: CorpusStats) -> tuple[float, dict]:
     }
 
 
-def recompute_authors(store, stats: CorpusStats, *, keep_detail: bool = True) -> dict:
-    """Build profiles then score them. Returns summary counts."""
+def recompute_authors(store: Any, stats: CorpusStats, *, keep_detail: bool = True) -> dict[str, Any]:
+    """Builds author profiles and computes composite scores."""
     built = build_profiles(store, stats)
-
-    # Author-scale quantiles are distinct from repo-scale ones: an author's
-    # total stars spans a different range than a single repository's.
     merged = CorpusStats({**stats.quantiles, **author_quantiles(store)}, n=stats.n)
 
     updates = []
     for row in store.db.execute("SELECT * FROM authors"):
         score, detail = score_author(row, merged)
-        updates.append((
-            score, json.dumps(detail) if keep_detail else None, row["login"]
-        ))
+        updates.append((score, json.dumps(detail) if keep_detail else None, row["login"]))
     store.db.executemany(
         "UPDATE authors SET author_score = ?, score_detail = ? WHERE login = ?",
         updates,
     )
     store.db.commit()
-    log.info("profiled and scored %d authors", len(updates))
+    log.info("Profiled and scored %d authors", len(updates))
     return {"authors": built, "scored": len(updates)}
 
 
-def author_scores(store) -> dict[str, float]:
+def author_scores(store: Any) -> dict[str, float]:
+    """Returns mapping of author logins to computed author scores."""
     ensure_schema(store)
     return {
         r["login"]: r["author_score"]
-        for r in store.db.execute(
-            "SELECT login, author_score FROM authors WHERE author_score > 0")
+        for r in store.db.execute("SELECT login, author_score FROM authors WHERE author_score > 0")
     }
 
 
-def get_author(store, login: str) -> dict | None:
+def get_author(store: Any, login: str) -> dict[str, Any] | None:
+    """Fetches profile details and score breakdown for a specific author login."""
     ensure_schema(store)
-    row = store.db.execute(
-        "SELECT * FROM authors WHERE login = ?", (login,)).fetchone()
+    row = store.db.execute("SELECT * FROM authors WHERE login = ?", (login,)).fetchone()
     if not row:
         return None
     data = dict(row)

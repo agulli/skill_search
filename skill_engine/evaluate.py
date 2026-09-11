@@ -1,41 +1,5 @@
-"""Retrieval quality evaluation.
+"""Retrieval evaluation suite: label-free known-item benchmarks, category coherence, and latency profiling."""
 
-Every other test in this project asserts a *property* — that duplicates
-collapse, that missing data does not zero a score, that a fork cannot outrank
-its original. None of them answer the question that actually matters: **when
-someone searches, do they get the right skill?**
-
-Answering that normally needs human relevance judgements, which do not exist for
-this corpus. What follows are the evaluations that can be run without them,
-each measuring something a labelled set would otherwise tell us.
-
-### Known-item retrieval — the primary metric
-
-The strongest label-free signal in information retrieval. Take a skill that is
-already in the index, construct a query from its *description* (never its name,
-which would make the task trivial), and check where the engine ranks that exact
-skill. The correct answer is known by construction, so precision, recall and
-MRR are all computable.
-
-Two details make it honest:
-
-* Queries are built from mid-frequency terms. Rare terms make retrieval trivial
-  (one document contains them); common terms make it impossible. The middle
-  band is where real queries live.
-* A hit counts when the returned skill shares the target's **content hash**.
-  The engine deliberately collapses duplicates, so demanding the exact row id
-  would score correct behaviour as failure.
-
-### Supporting evaluations
-
-* **Category coherence** — do results for a subject-specific query belong to
-  that subject, judged against the independently-built taxonomy?
-* **Robustness** — does the same intent expressed with reordered words, extra
-  filler, or fewer terms return the same thing?
-* **Ranking sanity** — among equally relevant results, do better skills win?
-* **Latency distribution** — percentiles across a realistic query mix, not one
-  cherry-picked query.
-"""
 
 from __future__ import annotations
 

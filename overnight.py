@@ -1,14 +1,15 @@
 #!/usr/bin/env python
-"""Unattended overnight run: harvest toward a skill target, then keep going.
+"""Unattended supervisor pipeline: alternates discovery and harvesting.
 
-Alternates two phases that use disjoint resources, so neither starves the other:
+Coordinates two independent ingestion loops:
+  1. Sweep: Streams repository archives over codeload (zero API quota, bandwidth-bound).
+  2. Discover: Expands repository queue via search bucket when queue depth drops.
 
-  sweep     codeload tarballs — no API quota at all, bandwidth-bound
-  discover  repository search — its own rate-limit bucket, expands the queue
+All progress checkpoints in SQLite WAL. The supervisor can be safely stopped
+and resumed at any point without lost state.
 
-Both are checkpointed in SQLite, so killing this at any moment loses nothing:
-the queue records what still needs doing and a restart resumes there. Every
-phase is wrapped so that one failure cannot end the run.
+Usage:
+    python overnight.py 100000 data/big.db
 """
 
 from __future__ import annotations
@@ -19,25 +20,35 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from skill_engine.config import Config
-from skill_engine.discover import (BREADTH_QUERIES, KEYWORD_QUERIES,
-                                   SCALE_QUERIES, search_repos)
+from skill_engine.discover import (
+    BREADTH_QUERIES,
+    KEYWORD_QUERIES,
+    SCALE_QUERIES,
+    search_repos,
+)
 from skill_engine.github import GitHubClient
 from skill_engine.ranking import recompute
 from skill_engine.store import Store
 from skill_engine.tarball import run_tarball_crawl
+
+if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+    print(__doc__.strip())
+    sys.exit(0)
 
 TARGET = int(sys.argv[1]) if len(sys.argv) > 1 else 100_000
 DB = sys.argv[2] if len(sys.argv) > 2 else "data/big.db"
 MAX_MB = int(os.getenv("SKILL_ENGINE_MAX_MB", "10"))
 CONCURRENCY = int(os.getenv("SKILL_ENGINE_SWEEP_CONCURRENCY", "5"))
 
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(levelname).1s %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
 logging.getLogger("httpx").setLevel(logging.ERROR)
@@ -45,7 +56,8 @@ logging.getLogger("skill_engine.github").setLevel(logging.WARNING)
 log = logging.getLogger("overnight")
 
 
-def counts(store) -> tuple[int, int]:
+def get_counts(store: Store) -> tuple[int, int]:
+    """Returns total indexed skills and remaining queued repositories."""
     skills = store.db.execute("SELECT COUNT(*) c FROM skills").fetchone()["c"]
     queued = store.db.execute(
         "SELECT COUNT(*) c FROM queue q JOIN repos r ON r.full_name = q.full_name "
@@ -55,57 +67,56 @@ def counts(store) -> tuple[int, int]:
     return skills, queued
 
 
-async def phase_sweep(store, cfg, target: int) -> int:
-    """Drain the queue over codeload. Returns skills indexed afterwards."""
+async def phase_sweep(store: Store, cfg: Config, target: int) -> int:
+    """Processes queued repositories via high-throughput archive streams."""
     started = time.time()
 
-    def progress(totals, indexed, rate, dl):
+    def progress(totals: dict[str, Any], indexed: int, rate: float, dl: dict[str, Any]) -> None:
         log.info(
-            "sweep %6d repos | %7d skills | %5.0f repos/h | %5.1fGB | "
-            "skip %d fail %d",
-            totals["repos"], indexed, rate, dl["bytes"] / 1e9,
-            dl["too_big"], dl["failed"],
+            "Sweep: %6d repos | %7d skills | %5.0f repos/hr | %5.1f GB | "
+            "Skipped: %d | Failed: %d",
+            totals["repos"],
+            indexed,
+            rate,
+            dl["bytes"] / 1e9,
+            dl["too_big"],
+            dl["failed"],
         )
 
     totals = await run_tarball_crawl(
-        store, cfg,
+        store,
+        cfg,
         target_skills=target,
         concurrency=CONCURRENCY,
         max_mb=MAX_MB,
-        # Batch must be much larger than concurrency. With both at 24 the
-        # sweep runs one batch at a time and waits for its slowest member,
-        # so one large tarball stalls 23 finished downloads — measured at
-        # 0.6 repos/s against a pacing floor that permits 6.7. A wide batch
-        # keeps the semaphore saturated: as each fetch finishes the next
-        # starts, so stragglers overlap with useful work instead of
-        # blocking it.
         batch=int(os.getenv("SKILL_ENGINE_SWEEP_BATCH", "400")),
-        rerank_every=int(os.getenv('SKILL_ENGINE_RERANK_EVERY', '2000')),
+        rerank_every=int(os.getenv("SKILL_ENGINE_RERANK_EVERY", "2000")),
         on_progress=progress,
     )
-    skills, _ = counts(store)
+    skills, _ = get_counts(store)
     log.info(
-        "sweep done: %d repos in %.1f min, %d skills total, %.1fGB downloaded",
-        totals["repos"], (time.time() - started) / 60, skills,
+        "Sweep complete: %d repos in %.1f min (%d skills total, %.1f GB downloaded)",
+        totals["repos"],
+        (time.time() - started) / 60,
+        skills,
         totals.get("download_stats", {}).get("bytes", 0) / 1e9,
     )
     return skills
 
 
-async def phase_discover(store, cfg, rounds: int) -> int:
-    """Widen the queue using the search bucket. Costs no core quota."""
+async def phase_discover(store: Store, cfg: Config, rounds: int) -> int:
+    """Expands the queue using search endpoints (uses separate search rate-limit bucket)."""
     gh = GitHubClient(cfg.tokens, etag_store=store)
     added = 0
     try:
         queries = SCALE_QUERIES + KEYWORD_QUERIES + BREADTH_QUERIES
-        for q in queries[: rounds]:
+        for q in queries[:rounds]:
             try:
-                _, new = await search_repos(gh, store, q, reason="overnight",
-                                            priority=110)
+                _, new = await search_repos(gh, store, q, reason="overnight", priority=110)
                 added += new
-                log.info("discover %-46s +%d (total new %d)", q[:46], new, added)
+                log.info("Discovery: %-46s +%d (Total new: %d)", q[:46], new, added)
             except Exception as exc:
-                log.warning("discover %r failed: %s", q, exc)
+                log.warning("Discovery query %r failed: %s", q, exc)
     finally:
         await gh.aclose()
     return added
@@ -116,8 +127,8 @@ async def main() -> None:
     cfg.max_skills_per_repo = 1500
     store = Store(cfg.db_path)
 
-    skills, queued = counts(store)
-    log.info("START: %d skills, %d repos queued, target %d", skills, queued, TARGET)
+    skills, queued = get_counts(store)
+    log.info("Starting pipeline: %d skills indexed, %d repos queued, target: %d", skills, queued, TARGET)
 
     round_no = 0
     stalled = 0
@@ -128,40 +139,49 @@ async def main() -> None:
         try:
             skills = await phase_sweep(store, cfg, TARGET)
         except Exception as exc:
-            log.exception("sweep phase failed, continuing: %s", exc)
+            log.exception("Harvest phase exception: %s", exc)
 
         if skills >= TARGET:
             break
 
-        _, queued = counts(store)
+        _, queued = get_counts(store)
         if queued < 3000:
-            log.info("queue low (%d); widening via search", queued)
+            log.info("Queue depth below threshold (%d); initiating discovery pass", queued)
             try:
                 await phase_discover(store, cfg, rounds=len(SCALE_QUERIES))
-                recompute(store)          # rank the newcomers before sweeping
+                recompute(store)
             except Exception as exc:
-                log.exception("discovery phase failed, continuing: %s", exc)
+                log.exception("Discovery phase exception: %s", exc)
 
-        skills, queued = counts(store)
+        skills, queued = get_counts(store)
         gained = skills - before
         stalled = stalled + 1 if gained < 50 else 0
-        log.info("round %d: +%d skills (now %d), %d queued, stalled=%d",
-                 round_no, gained, skills, queued, stalled)
+        log.info(
+            "Round %d finished: +%d skills (Total: %d, Queued: %d, Stalled: %d)",
+            round_no,
+            gained,
+            skills,
+            queued,
+            stalled,
+        )
 
     try:
         recompute(store)
     except Exception as exc:
-        log.warning("final rank failed: %s", exc)
+        log.warning("Final ranking pass failed: %s", exc)
 
-    skills, queued = counts(store)
-    valid = store.db.execute(
-        "SELECT COUNT(*) c FROM skills WHERE valid=1").fetchone()["c"]
-    uniq = store.db.execute(
-        "SELECT COUNT(DISTINCT content_hash) c FROM skills").fetchone()["c"]
-    repos = store.db.execute(
-        "SELECT COUNT(*) c FROM repos WHERE tree_sha IS NOT NULL").fetchone()["c"]
-    log.info("FINISHED: %d skills (%d valid, %d unique) from %d repos; %d still queued",
-             skills, valid, uniq, repos, queued)
+    skills, queued = get_counts(store)
+    valid = store.db.execute("SELECT COUNT(*) c FROM skills WHERE valid=1").fetchone()["c"]
+    uniq = store.db.execute("SELECT COUNT(DISTINCT content_hash) c FROM skills").fetchone()["c"]
+    repos = store.db.execute("SELECT COUNT(*) c FROM repos WHERE tree_sha IS NOT NULL").fetchone()["c"]
+    log.info(
+        "Ingestion finished: %d skills (%d valid, %d unique) from %d repos; %d remaining in queue",
+        skills,
+        valid,
+        uniq,
+        repos,
+        queued,
+    )
     store.close()
 
 
@@ -169,4 +189,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        log.info("interrupted — state is checkpointed, rerun to resume")
+        log.info("Execution interrupted by user. State is checkpointed in SQLite.")

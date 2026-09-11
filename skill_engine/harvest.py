@@ -1,19 +1,5 @@
-"""Harvesting: turn a repository into indexed skills.
+"""Targeted REST and GraphQL repository harvester with ETag caching and delta updates."""
 
-The cost model is what matters here. Per repository:
-
-* **1 request** for metadata (or 0, on a 304).
-* **1 request** for the *entire* recursive file tree — this is the move code
-  search cannot match. `GET /git/trees/{branch}?recursive=1` returns every path
-  in the repo along with each file's blob SHA.
-* **0 requests** for any SKILL.md whose blob SHA is unchanged since last crawl.
-* **1 raw fetch** (off the REST rate limit entirely) per genuinely changed file.
-
-So a steady-state re-crawl of a repo that has not moved costs a single
-conditional request that returns 304 and consumes no quota at all. That is the
-difference between a crawler that scales to the whole ecosystem and one that
-burns 5,000 requests on a few hundred repos.
-"""
 
 from __future__ import annotations
 

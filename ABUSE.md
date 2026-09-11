@@ -1,91 +1,74 @@
-# Resisting scraping and abuse
+# Security & Abuse Mitigation Architecture
 
-## What is actually being defended
+## 1. Overview & Threat Model
 
-The corpus is public GitHub content. Every skill in it came from a public
-repository, and anyone with a token and a weekend can rebuild it — that is
-precisely how it was built. **The data cannot be made secret, and treating
-that as the goal leads to defences that cost real users something and buy
-nothing.**
+`skill-engine` indexes publicly available agent skills published across open-source repositories (GitHub, GitLab, and Hugging Face). The primary objectives of the defense architecture are:
 
-Two things are worth defending, and both are achievable:
+1. **Service Availability & Reliability**: Protect the search API and web frontend from high-concurrency denial-of-service or exhaustive enumeration that degrades performance for normal users.
+2. **Compute & Resource Protection**: Prevent CPU and memory exhaustion on lean container deployments running full-text search queries (SQLite FTS5) over large indices.
+3. **Data Integrity & Safe Agent Interaction**: Ensure read-only safety when exposing search endpoints and MCP servers to autonomous agents and automated callers.
 
-1. **Availability and cost.** A search runs a full-text query over a 0.6 GB
-   index on a single 1 GB machine. A loop can saturate it, and the people it
-   degrades are the ones using the site normally.
-2. **The derived work.** The ranking, the author reputation model, and the
-   taxonomy are the product. They took the measurement and iteration recorded
-   in `whitepaper.md`. Bulk extraction lifts that for free.
+---
 
-## The defences, and what each one is worth
+## 2. Multi-Layered Defense Strategy
 
-| Layer | Stops | Does not stop |
+| Layer | Mechanism | Scope & Mitigation |
 |---|---|---|
-| Page-size cap (50) | Cheap bulk extraction | Patient extraction |
-| Offset cap (1,000) | Walking a category end to end | Enumeration via varied queries |
-| Cost-weighted limiter | Sustained load from one address | A distributed scraper |
-| `robots.txt` | Well-behaved crawlers | Anyone who ignores it |
-| Cloudflare rules | Most of the above, at the edge | A determined, funded actor |
+| **Edge / CDN** | Cloudflare WAF & Bot Management | Mitigates volumetric DDoS, IP rotation attacks, and unauthenticated scrapers before reaching the origin. |
+| **Network & IP Limiting** | Dynamic Token Bucket Limiter | Enforces per-IP cost-weighted rate limiting with burst allowance. |
+| **Query & Pagination Caps** | Enforced bounds on `limit` and `offset` | Restricts deep offset pagination (`offset <= 1000`) and limits page size (`limit <= 50`). |
+| **Filesystem & DB Safety** | Immutable SQLite Connections | Exposes databases in strict read-only mode (`SQLITE_OPEN_READONLY`) for public serving. |
 
-### Cost weighting
+---
 
-The limiter originally charged one token per request, so the ceiling was set by
-the cheapest endpoint: loose enough to be polite to a browser loading a page,
-and therefore far too loose for the endpoint that runs a query over the index.
-Requests are now priced by what they cost to serve, scaled by page size and
-offset depth.
+## 3. Cost-Weighted Rate Limiting
 
-Burst and rate defend different populations and are tuned separately. The
-search box debounces at 110 ms, so a person typing and correcting fires several
-searches within a second or two — **burst** is what keeps them from being
-throttled mid-sentence. **Rate** is what bounds a scraper, since extraction is a
-marathon and one burst barely moves it.
+Rather than charging a uniform cost per request, the rate limiter assigns costs proportional to database computation and data transfer overhead:
 
-### Measured effect
+```python
+# Rate limiter cost allocation
+COSTS = {
+    "/api/search": 3.0,      # FTS5 query + BM25 ranking + dynamic faceting
+    "/api/browse": 3.0,      # Category scan + score sorting
+    "/api/skill": 1.0,       # Point lookup by primary key
+    "/api/categories": 0.5,  # Cached taxonomy structure
+    "/": 0.25,               # Static landing page
+    "/health": 0.0,          # Zero-cost health check (unthrottled)
+    "/robots.txt": 0.0,      # Standard crawler directive
+}
+```
 
-Walking the full 100,006-skill corpus:
+### Depth & Pagination Penalties
+To deter automated scrapers from systematically dumping categories, request cost scales with pagination depth:
 
-| | requests | time |
-|---|---|---|
-| Before | 500 | ~2 minutes |
-| After | 2,000 | ~133 minutes |
+$$\text{Total Cost} = \left( \text{Base Cost} + \frac{\min(\text{offset}, 1000)}{200} \right) \times \left(1 + \frac{\min(\text{limit}, 50)}{100}\right)$$
 
-A human still gets eight searches back to back and ten page loads a second.
+### Burst vs. Sustained Rate
+- **Burst Capacity (e.g., 10 tokens)**: Accommodates interactive UI features (e.g., live search debounced at 110ms) without throttling responsive user keystrokes.
+- **Sustained Refill Rate (e.g., 1.5 tokens/sec)**: Bounds sustained scraper throughput over time.
 
-## What is not defended, honestly
+---
 
-**A distributed scraper defeats all of this.** Every limit here is per-address.
-Rotating through a few hundred addresses restores the original throughput, and
-no per-IP scheme can prevent that. Cloudflare's bot management is the only layer
-positioned to see that pattern, which is why the edge rules matter more than
-anything in this repository.
+## 4. Privacy-Preserving Telemetry
 
-**Rate limiting cannot distinguish a scraper from an enthusiast.** The limits
-are set where normal use is comfortable, which necessarily leaves room for
-patient extraction. Tightening until scraping is impossible would break the
-site for people using it properly.
+When requests exceed rate limits, the engine records structured warning logs without logging raw user IP addresses. Client identifiers are pseudonymized via a keyed hash:
 
-## Visibility
+```python
+client_handle = hashlib.sha256(f"{client_ip}:{salt}".encode()).hexdigest()[:12]
+log.warning("Rate limit exceeded for client [%s] on endpoint %s", client_handle, path)
+```
 
-Until this change the server recorded **nothing** about requests — `log_message`
-sat at `DEBUG` beneath an `INFO` root — so a report of scraping could be neither
-confirmed nor refuted. Throttling events now log at `WARNING` with a salted,
-truncated per-process handle for the client instead of an address: enough to
-separate "one client made 9,000 requests" from "9,000 clients made one", which
-is the whole question when judging whether traffic is abuse, without putting IP
-addresses in logs.
+This provides visibility into single-actor vs. distributed traffic anomalies while respecting client privacy.
 
-    fly logs -a searchskills | grep throttled
+---
 
-## Recommended edge configuration
+## 5. Recommended Edge Deployment Configuration
 
-In the Cloudflare dashboard for `searchskills.ai`:
+For production deployments using Cloudflare in front of the application:
 
-1. **Security → Bots → Bot Fight Mode: on.** Free, and handles the
-   unsophisticated majority.
-2. **Security → WAF → Rate limiting rules.** One rule:
-   `URI Path contains /api/` → 60 requests per minute per IP → Managed
-   Challenge. This runs at the edge, so throttled traffic never reaches or
-   costs the origin.
-3. **Leave the landing page cached.** `cf-cache-status: HIT` means most
-   traffic never touches the machine at all — the cheapest defence available.
+1. **WAF Rate Limiting Rule**:
+   - Condition: `(http.request.uri.path contains "/api/")`
+   - Threshold: 60 requests per minute per IP.
+   - Action: Managed Challenge.
+2. **Bot Fight Mode**: Enabled to block automated headless browsers and known malicious user agents.
+3. **Static Asset Caching**: Cache HTML landing pages and static assets (`s-maxage=3600`) at Cloudflare edge nodes.

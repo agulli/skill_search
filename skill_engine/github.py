@@ -1,18 +1,5 @@
-"""A GitHub API client built for sustained crawling.
+"""Asynchronous GitHub API client supporting token pooling, conditional ETag requests, and adaptive backoff."""
 
-Three things keep this alive where a naive crawler dies:
-
-1. **Conditional requests.** Every GET carries the ETag we saw last time. A 304
-   response costs no rate-limit quota at all, so re-crawling a repo that has not
-   changed is free. This matters more than any other optimisation here.
-2. **A token pool.** Each PAT gets 5,000 core requests/hour. We track every
-   token's remaining quota per resource bucket (core, search, code_search,
-   graphql) from the response headers and always route to the token with the
-   most headroom, sleeping only when every token is spent.
-3. **Honest backoff.** Primary limits are visible in the headers. Secondary
-   limits are not: they arrive as a 403 or 429 with a `retry-after` header and
-   no warning. We obey the header exactly rather than guessing.
-"""
 
 from __future__ import annotations
 

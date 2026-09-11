@@ -1,33 +1,15 @@
-"""The ranking layer: turning raw GitHub metadata into a defensible quality prior.
+"""Quality ranking engine: computes corpus-calibrated priors from repository and skill metadata.
 
-Design rules, each of which exists because the obvious alternative fails:
-
-**Percentile, not magic constants.** Star counts are power-law distributed: the
-gap between 10 and 100 stars means far more than the gap between 10,000 and
-10,100. Hand-tuned formulas like `9 * log10(stars)` encode a guess about corpus
-scale that silently rots as the corpus grows. Instead every heavy-tailed metric
-is normalised against the corpus's own distribution, so "top 5% by stars" means
-the same thing whether the index holds 500 repositories or 500,000.
-
-**Bounded families.** Signals are grouped into families (popularity, momentum,
-maintenance, authority, craft, distinctiveness), each contributing at most its
-weight. No single metric can dominate, which is what stops the index from
-degenerating into a star-count leaderboard.
-
-**Missing data must not mean zero.** Different endpoints populate different
-fields, so a repository discovered via search has no `subscribers` and one that
-has never been enriched has no `contributors`. Scoring those as 0 would punish
-a repository for *our* crawl budget rather than its own quality. Absent signals
-are dropped and their weight is redistributed across the ones we do have.
-
-**Multiplicative trust, additive quality.** Being archived or being a fork is
-not "a few points worse" — it is a different category of thing. Those apply as
-a multiplier on the whole score, so a fork cannot climb past an original by
-accumulating small additive wins elsewhere.
-
-**Explainable.** Every score carries a JSON breakdown of which family
-contributed what. A ranking you cannot interrogate is a ranking you cannot
-debug, and `skill-engine explain` prints exactly why a result sits where it does.
+Architecture Principles:
+1. Percentile Normalization: Heavy-tailed signals (stars, forks, repo size) are normalized
+   against the empirical corpus distribution rather than arbitrary log constants.
+2. Decoupled Families: Signals are organized into decoupled families (popularity, momentum,
+   maintenance, authority, craft, distinctiveness) with bounded weights.
+3. Missing Data Neutrality: When specific metadata fields are missing, weights are dynamically
+   redistributed across available signals rather than penalizing missing data with zeros.
+4. Multiplicative Trust Penalties: Structural status (archived, forks, disabled, aggregator dumps)
+   applies multiplicatively to the entire composite score.
+5. Explainability: Every score retains a full JSON breakdown of family contributions.
 """
 
 from __future__ import annotations
@@ -37,15 +19,13 @@ import json
 import logging
 import math
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any, Iterable
 
 from .metadata import days_since
 
 log = logging.getLogger("skill_engine.ranking")
 
-# Metrics normalised by corpus percentile. Heavy-tailed or scale-dependent
-# quantities belong here; bounded ratios and booleans do not.
 PERCENTILE_METRICS = (
     "stars", "forks", "subscribers", "open_issues", "size_kb",
     "stars_per_day", "contributors", "releases", "skill_count",
@@ -55,68 +35,64 @@ PERCENTILE_METRICS = (
 
 @dataclass
 class Weights:
-    """Family weights for the composite score. Must be positive; scale is free."""
+    """Weights and parameters for composite quality scoring."""
 
-    # Repository-level families. These decide `repo_score`.
+    # Repository-level scoring weights
     popularity: float = 0.22
     momentum: float = 0.14
     maintenance: float = 0.16
     authority: float = 0.13
 
-    # Skill-level families, stated explicitly rather than inherited from the
-    # repo weights above. Deriving the repo's share by summing the four
-    # repository families gave it 65% of a skill's score, which is the wrong
-    # balance for a *skill* search engine: it made every skill in one strong
-    # repository outrank every skill everywhere else, regardless of how good the
-    # individual skill was. The repository is context, not the subject.
+    # Skill-level composite weights
     repo_standing: float = 0.32
     author_standing: float = 0.16
     craft: float = 0.33
     distinctiveness: float = 0.19
 
-    # Half-lives in days for the recency curves.
+    # Recency half-life parameters in days
     push_halflife: float = 120.0
     release_halflife: float = 240.0
 
-    # Multiplicative trust penalties.
+    # Multiplicative trust penalty factors
     archived_factor: float = 0.55
     fork_factor: float = 0.45
     disabled_factor: float = 0.25
     template_factor: float = 0.90
     unlicensed_factor: float = 0.93
-    # A repo carrying thousands of SKILL.md files is an aggregator dump, not a
-    # curated collection; its individual skills are usually vendored copies.
+
+    # Aggregator repository thresholds
     dump_threshold: int = 500
     dump_factor: float = 0.70
 
-    # Inorganic-popularity guard. Stars are the cheapest signal to manufacture
-    # and the most expensive to ignore, so we cross-check them against the
-    # signals that are hard to fake: forks (someone actually took a copy) and
-    # contributors (someone actually did work). A repository with thousands of
-    # stars and almost no forks is being promoted rather than used.
-    # Calibrated against the live corpus rather than guessed. Across repos with
-    # >=500 stars the fork/star ratio runs p50=0.104, p25=0.083, p10=0.060,
-    # p5=0.048, p1=0.009 — so 0.012 sits just above the 1st percentile and flags
-    # ~1.7% of them. Tight enough to catch only the genuine tail; loose enough
-    # that ordinary variation never trips it.
+    # Synthetic popularity guard thresholds
     anomaly_min_stars: int = 500
     anomaly_fork_ratio: float = 0.012
     anomaly_factor: float = 0.72
 
 
-def recency(days: float | None, halflife: float) -> float | None:
-    """Exponential decay in [0, 1]. None in, None out — never a silent zero."""
+def recency(days: float | None, halflife_days: float) -> float | None:
+    """Computes exponential half-life decay.
+
+    Args:
+        days: Elapsed days since event, or None.
+        halflife_days: Half-life in days where score equals 0.5.
+
+    Returns:
+        Decayed score in (0, 1] or None if days is None.
+    """
     if days is None:
         return None
-    return 0.5 ** (days / halflife)
+    return math.exp(-max(days, 0.0) * (math.log(2.0) / max(halflife_days, 1.0)))
 
 
-def blend(components: Iterable[tuple[str, float | None, float]]) -> tuple[float, dict]:
-    """Weighted mean over the components that actually have a value.
+def blend(components: Iterable[tuple[str, float | None, float]]) -> tuple[float, dict[str, Any]]:
+    """Weighted sum of available signals, redistributing weights for missing components.
 
-    Returns (value in [0,1], per-component detail). When a component is None its
-    weight is redistributed rather than counted as zero, so a repository is
-    never penalised for metadata we did not fetch.
+    Args:
+        components: Tuples of (name, value_or_None, weight).
+
+    Returns:
+        Tuple of (normalized_score, detail_dictionary).
     """
     total_weight = 0.0
     accumulated = 0.0
@@ -130,21 +106,24 @@ def blend(components: Iterable[tuple[str, float | None, float]]) -> tuple[float,
         accumulated += value * weight
         total_weight += weight
     if total_weight == 0.0:
-        return 0.5, detail  # nothing known: neutral, not zero
+        return 0.5, detail
     return accumulated / total_weight, detail
 
 
 class CorpusStats:
-    """Quantile boundaries per metric, so scoring is relative to the corpus."""
+    """Manages empirical quantile distributions for corpus-relative scoring."""
 
-    def __init__(self, quantiles: dict[str, list[float]] | None = None,
-                 n: int = 0) -> None:
+    def __init__(
+        self,
+        quantiles: dict[str, list[float]] | None = None,
+        n: int = 0,
+    ) -> None:
         self.quantiles = quantiles or {}
         self.n = n
 
     @classmethod
-    def compute(cls, store) -> "CorpusStats":
-        """Derive quantiles from everything currently indexed."""
+    def compute(cls, store: Any) -> "CorpusStats":
+        """Calculates percentile thresholds from active database records."""
         rows = store.db.execute(
             """
             SELECT stars, forks, subscribers, open_issues, size_kb, contributors,
@@ -154,35 +133,31 @@ class CorpusStats:
         ).fetchall()
         samples: dict[str, list[float]] = {m: [] for m in PERCENTILE_METRICS}
         for r in rows:
-            for m in ("stars", "forks", "subscribers", "open_issues", "size_kb",
-                      "contributors", "releases", "skill_count"):
+            for m in (
+                "stars", "forks", "subscribers", "open_issues", "size_kb",
+                "contributors", "releases", "skill_count",
+            ):
                 v = r[m]
                 if v is not None:
                     samples[m].append(float(v))
             age = days_since(r["created_at"])
             if age is not None and r["stars"] is not None:
-                # Floor the age so a three-day-old repo with 5 stars does not
-                # read as the fastest-growing project in the corpus.
                 samples["stars_per_day"].append(float(r["stars"]) / max(age, 30.0))
 
         for m, col in (("body_len", "body_len"), ("resource_count", None)):
             if col:
                 samples[m] = [
                     float(x["body_len"])
-                    for x in store.db.execute(
-                        "SELECT body_len FROM skills WHERE valid = 1"
-                    )
+                    for x in store.db.execute("SELECT body_len FROM skills WHERE valid = 1")
                 ]
         samples["resource_count"] = [
             float(len(json.loads(x["resources"] or "[]")))
-            for x in store.db.execute(
-                "SELECT resources FROM skills WHERE valid = 1"
-            )
+            for x in store.db.execute("SELECT resources FROM skills WHERE valid = 1")
         ]
 
         quantiles: dict[str, list[float]] = {}
         for metric, values in samples.items():
-            if len(values) < 8:  # too few to describe a distribution
+            if len(values) < 8:
                 continue
             values.sort()
             quantiles[metric] = [
@@ -191,7 +166,8 @@ class CorpusStats:
             ]
         return cls(quantiles, n=len(rows))
 
-    def save(self, store) -> None:
+    def save(self, store: Any) -> None:
+        """Persists computed quantile boundaries to database."""
         now = time.time()
         for metric, qs in self.quantiles.items():
             store.db.execute(
@@ -203,23 +179,16 @@ class CorpusStats:
         store.commit()
 
     @classmethod
-    def load(cls, store) -> "CorpusStats":
-        rows = store.db.execute(
-            "SELECT metric, quantiles, n FROM corpus_stats"
-        ).fetchall()
+    def load(cls, store: Any) -> "CorpusStats":
+        """Loads quantile distributions from database."""
+        rows = store.db.execute("SELECT metric, quantiles, n FROM corpus_stats").fetchall()
         return cls(
             {r["metric"]: json.loads(r["quantiles"]) for r in rows},
             n=rows[0]["n"] if rows else 0,
         )
 
     def pct(self, metric: str, value: float | None) -> float | None:
-        """Mid-rank percentile of `value` within the corpus, in [0, 1].
-
-        Mid-rank (averaging the left and right insertion points) is what makes
-        this behave at the bottom of the distribution: roughly half the corpus
-        has zero stars, and a plain `bisect_left` would score every one of them
-        identically to the single least-popular repository.
-        """
+        """Returns mid-rank percentile of value within corpus distribution in range [0, 1]."""
         if value is None:
             return None
         qs = self.quantiles.get(metric)
@@ -230,11 +199,8 @@ class CorpusStats:
         return ((lo + hi) / 2.0) / (len(qs) - 1)
 
 
-# ------------------------------------------------------------------- signals
-
-
 def repo_derived(row: Any) -> dict[str, float | None]:
-    """Ratios and rates the raw counts cannot express."""
+    """Extracts derived rates and metrics from raw repository attributes."""
     stars = row["stars"] or 0
     forks = row["forks"] or 0
     age = days_since(row["created_at"])
@@ -243,14 +209,16 @@ def repo_derived(row: Any) -> dict[str, float | None]:
         "days_since_push": days_since(row["pushed_at"]),
         "days_since_release": days_since(row["latest_release"]),
         "stars_per_day": (stars / max(age, 30.0)) if age is not None else None,
-        # High fork-to-star ratio marks templates and tutorials — things people
-        # copy rather than depend on.
         "fork_ratio": (forks / stars) if stars >= 10 else None,
     }
 
 
-def trust_multiplier(row: Any, w: Weights,
-                     derived: dict | None = None) -> tuple[float, dict]:
+def trust_multiplier(
+    row: Any,
+    w: Weights,
+    derived: dict[str, Any] | None = None,
+) -> tuple[float, dict[str, float]]:
+    """Calculates multiplicative trust factor based on repo status flags."""
     factor = 1.0
     applied: dict[str, float] = {}
 
@@ -277,20 +245,20 @@ def trust_multiplier(row: Any, w: Weights,
     if stars >= w.anomaly_min_stars:
         fork_ratio = d.get("fork_ratio")
         contributors = row["contributors"]
-        # Applied only when a hard-to-fake signal is present and contradicts the
-        # star count — never on absent data, which would punish un-enriched rows.
         starved_of_forks = fork_ratio is not None and fork_ratio < w.anomaly_fork_ratio
-        solo_but_huge = (
-            contributors is not None and contributors <= 1 and stars >= 2000
-        )
+        solo_but_huge = contributors is not None and contributors <= 1 and stars >= 2000
         if starved_of_forks or solo_but_huge:
             apply("inorganic_popularity", w.anomaly_factor)
 
     return factor, applied
 
 
-def score_repo(row: Any, stats: CorpusStats, w: Weights = Weights()) -> tuple[float, dict]:
-    """Query-independent quality of a repository, 0–100, with a breakdown."""
+def score_repo(
+    row: Any,
+    stats: CorpusStats,
+    w: Weights = Weights(),
+) -> tuple[float, dict[str, Any]]:
+    """Computes normalized quality score (0-100) for a repository."""
     d = repo_derived(row)
     topics = json.loads(row["topics"] or "[]")
 
@@ -310,7 +278,6 @@ def score_repo(row: Any, stats: CorpusStats, w: Weights = Weights()) -> tuple[fl
         ("release_recency", recency(d["days_since_release"], w.release_halflife), 0.20),
         ("release_count", stats.pct("releases", row["releases"]), 0.10),
         ("issues_enabled", 1.0 if row["has_issues"] else 0.0, 0.10),
-        # An unbounded open-issue pile on a small project reads as abandonment.
         ("issue_load", 1.0 - (stats.pct("open_issues", row["open_issues"]) or 0.5), 0.10),
     ])
 
@@ -342,26 +309,17 @@ def score_repo(row: Any, stats: CorpusStats, w: Weights = Weights()) -> tuple[fl
         "maintenance": main_detail,
         "authority": auth_detail,
         "penalties": trust_detail,
-        "derived": {k: (round(v, 3) if isinstance(v, float) else v)
-                    for k, v in d.items()},
+        "derived": {k: (round(v, 3) if isinstance(v, float) else v) for k, v in d.items()},
     }
 
 
-def craft_score(skill: Any, stats: CorpusStats) -> tuple[float, dict]:
-    """How well-made this skill is, judged only on the file itself.
-
-    Deliberately independent of the repository and the author. That is what
-    lets `authors.py` aggregate craft into an author's reputation without
-    circularity: author standing feeds the skill score, so the skill signal it
-    is built from must not already contain author standing.
-    """
+def craft_score(skill: Any, stats: CorpusStats) -> tuple[float, dict[str, Any]]:
+    """Evaluates the structural craft quality of a single SKILL.md file."""
     resources = json.loads(skill["resources"] or "[]")
     tools = json.loads(skill["allowed_tools"] or "[]")
     warnings = [x for x in (skill["warnings"] or "").split("; ") if x]
     dlen = len(skill["description"] or "")
 
-    # A description is a retrieval surface: too short says nothing, too long
-    # stops being a summary. The spec's own limit is 1024.
     if dlen == 0:
         desc_fit = 0.0
     elif dlen < 40:
@@ -393,48 +351,24 @@ def score_skill(
     owner_count: int = 1,
     name_collisions: int = 1,
     author_score: float | None = None,
-) -> tuple[float, dict]:
-    """Quality of one skill: its own craft, its repository, and its author."""
+) -> tuple[float, dict[str, Any]]:
+    """Computes the composite quality score for a skill across craft, repo, and author signals."""
     repo_score, repo_detail = score_repo(repo, stats)
     craft, craft_detail = craft_score(skill, stats)
 
-    # How many *different people* hold a copy, and how many copies each holds.
-    # Raw copy count cannot tell these apart, and they mean opposite things.
     owners = max(int(owner_count or 1), 1)
     copies_per_owner = max(dup_count, 1) / owners
 
     distinct, dist_detail = blend([
-        # Adoption. This signal used to be `uniqueness`: 1/(1+log2(copies)),
-        # on the reasoning that "1 copy is unique, 10 copies is boilerplate".
-        # Measured against the corpus, that is backwards for the dominant case.
-        # The most-copied skills sit in *different owners'* accounts at a ratio
-        # of 0.87-0.95 — skill-creator has 1,998 copies across 1,820 distinct
-        # owners — so the copies are ~1,800 independent people each choosing to
-        # vendor it. That is adoption evidence, structurally the same as a
-        # citation count, and the old signal demoted precisely the skills the
-        # community had most clearly endorsed.
-        #
-        # Floored at 0.5 rather than scaled from 0, so a genuinely rare skill
-        # is not punished for being rare — adoption is a bonus for the widely
-        # held, not a tax on the obscure.
         ("adoption", 0.5 + 0.5 * min(1.0, math.log2(1 + owners) / 11.0), 0.40),
-        # Sprawl. The original insight survives where it actually applies:
-        # clone-website has 1,514 copies across only 502 owners (0.33), which
-        # is one account duplicating a file rather than a community adopting
-        # it. Copies-per-owner separates the two cleanly.
         ("not_sprawl", 1.0 / (1.0 + math.log2(max(copies_per_owner, 1.0))), 0.20),
         ("name_uniqueness", 1.0 / (1.0 + 0.5 * math.log2(max(name_collisions, 1))), 0.20),
-        # A repo of 12 curated skills beats one of 4,000 scraped ones.
-        ("repo_focus", 1.0 if (repo["skill_count"] or 1) <= 60 else
-                       max(0.25, 60.0 / (repo["skill_count"] or 1)), 0.20),
+        ("repo_focus", 1.0 if (repo["skill_count"] or 1) <= 60 else max(0.25, 60.0 / (repo["skill_count"] or 1)), 0.20),
     ])
 
     base, families = blend([
         ("repo_standing", repo_score / 100.0, w.repo_standing),
-        # None when the author has not been profiled: `blend` redistributes the
-        # weight rather than scoring them zero for our missing data.
-        ("author_standing",
-         None if author_score is None else author_score / 100.0, w.author_standing),
+        ("author_standing", None if author_score is None else author_score / 100.0, w.author_standing),
         ("craft", craft, w.craft),
         ("distinctiveness", distinct, w.distinctiveness),
     ])
@@ -456,20 +390,11 @@ def score_skill(
     }
 
 
-# --------------------------------------------------------------- recompute
-
-
-def recompute(store, w: Weights = Weights(), *, keep_detail: bool = True) -> dict:
-    """Rescore every repository and skill from stored data. No network access.
-
-    Deliberately a separate pass rather than something done during the crawl:
-    percentile normalisation needs the whole corpus, so a score assigned while
-    crawling would be computed against a distribution that no longer exists by
-    the time the crawl ends. Re-run this after any significant ingest.
-    """
+def recompute(store: Any, w: Weights = Weights(), *, keep_detail: bool = True) -> dict[str, Any]:
+    """Recomputes scores for all repositories and skills in the store."""
     stats = CorpusStats.compute(store)
     stats.save(store)
-    log.info("corpus stats over %d repos, %d metrics", stats.n, len(stats.quantiles))
+    log.info("Corpus statistics computed over %d repositories, %d metrics", stats.n, len(stats.quantiles))
 
     repos = {r["full_name"]: r for r in store.db.execute("SELECT * FROM repos")}
     updates = []
@@ -491,9 +416,6 @@ def recompute(store, w: Weights = Weights(), *, keep_detail: bool = True) -> dic
         dup_counts[r["h"]] = r["c"]
         owner_counts[r["h"]] = r["o"]
 
-    # Duplicate counts must be written before authors are profiled: originality
-    # is measured from them, and a stale dup_count would credit a wholesale
-    # copier with original work.
     store.db.executemany(
         "UPDATE skills SET dup_count = ? WHERE content_hash = ?",
         [(c, h) for h, c in dup_counts.items()],
@@ -506,13 +428,13 @@ def recompute(store, w: Weights = Weights(), *, keep_detail: bool = True) -> dic
         recompute_authors(store, stats, keep_detail=keep_detail)
         authors = author_scores(store)
     except Exception as exc:
-        log.warning("author scoring failed (continuing without it): %s", exc)
+        log.warning("Author scoring failed (continuing without it): %s", exc)
         authors = {}
+
     name_counts = {
         r["name"]: r["c"]
         for r in store.db.execute(
-            "SELECT name, COUNT(DISTINCT repo) c FROM skills "
-            "WHERE name != '' GROUP BY name"
+            "SELECT name, COUNT(DISTINCT repo) c FROM skills WHERE name != '' GROUP BY name"
         )
     }
 
@@ -523,7 +445,10 @@ def recompute(store, w: Weights = Weights(), *, keep_detail: bool = True) -> dic
             continue
         dups = dup_counts.get(s["content_hash"], 1)
         score, detail = score_skill(
-            s, repo, stats, w,
+            s,
+            repo,
+            stats,
+            w,
             dup_count=dups,
             owner_count=owner_counts.get(s["content_hash"], 1),
             name_collisions=name_counts.get(s["name"], 1),
@@ -547,5 +472,6 @@ def recompute(store, w: Weights = Weights(), *, keep_detail: bool = True) -> dic
     }
 
 
-def default_weights() -> dict:
+def default_weights() -> dict[str, Any]:
+    """Returns default ranking weights as dictionary."""
     return asdict(Weights())
