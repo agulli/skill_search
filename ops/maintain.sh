@@ -14,23 +14,29 @@ cd "$(dirname "$0")/.."
 export GITHUB_TOKEN="$(gh auth token)"
 INTERVAL="${SKILL_ENGINE_CYCLE_SECONDS:-3600}"
 
-# Refuse to run twice. Two of these — or one of these alongside a manually
-# started crawler — means two writers on one SQLite file, which is how a
-# 33.7 GB write-ahead log happened: neither connection could checkpoint past
-# the other's read snapshot.
-if pgrep -f "ops/maintain.sh" | grep -qv "^$$\$"; then
-  others=$(pgrep -f "ops/maintain.sh" | grep -v "^$$\$" | wc -l | tr -d ' ')
-  if [ "$others" -gt 0 ]; then
-    echo "$(date +%F' '%H:%M) another maintain.sh is running; exiting" >> logs/maintain.log
-    exit 0
-  fi
+# Refuse to run twice, via a lockfile holding the loop's own PID.
+#
+# pgrep is not usable for this: the timeout subshell forked below is a copy of
+# this script and appears in `ps` with an identical command line, so a
+# pgrep-based guard both miscounts and would refuse a legitimate restart. A
+# lockfile naming one PID has no such ambiguity, and checking that the PID is
+# alive means a crashed loop does not lock itself out.
+LOCK="logs/maintain.pid"
+if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
+  echo "$(date +%F' '%H:%M) maintain.sh already running as PID $(cat "$LOCK"); exiting" \
+    >> logs/maintain.log
+  exit 0
 fi
+echo $$ > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT INT TERM
 
 while true; do
   echo "$(date +%F' '%H:%M) cycle start" >> logs/maintain.log
 
-  # Never run alongside a crawler started by hand.
-  if pgrep -f "discover_hard.py" >/dev/null || pgrep -f "overnight.py" >/dev/null; then
+  # Never run alongside a crawler started by hand. These match Python
+  # processes, not this script, so pgrep is unambiguous here.
+  if pgrep -f "python.*discover_hard.py" >/dev/null \
+     || pgrep -f "python.*overnight.py" >/dev/null; then
     echo "$(date +%F' '%H:%M) a crawler is already running; skipping this cycle" \
       >> logs/maintain.log
     sleep "$INTERVAL"

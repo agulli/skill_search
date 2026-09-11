@@ -10,3 +10,4 @@ logs/
 
 # Rust build output
 rust/target/
+logs/maintain.pid
