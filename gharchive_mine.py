@@ -74,7 +74,8 @@ async def mine_hour(
             return []
         raw = gzip.decompress(resp.content)
     except Exception as exc:
-        log.warning("%s: %s", url.rsplit("/", 1)[-1], type(exc).__name__)
+        log.warning("%s: %s: %s", url.rsplit("/", 1)[-1],
+                    type(exc).__name__, exc)
         return []
 
     found: list[str] = []

@@ -116,7 +116,8 @@ async def gitlab_discover(client: httpx.AsyncClient, terms: list[str],
             for p in r.json():
                 seen.setdefault(p["path_with_namespace"], p)
         except Exception as exc:
-            log.warning("gitlab search %r failed: %s", term, type(exc).__name__)
+            log.warning("gitlab search %r failed: %s: %s", term,
+                        type(exc).__name__, exc)
     return list(seen.values())
 
 
@@ -178,7 +179,8 @@ async def hf_discover(client: httpx.AsyncClient, terms: list[str],
                     item["_kind"] = kind
                     seen.setdefault(f"{kind}:{item['id']}", item)
             except Exception as exc:
-                log.warning("hf %s %r failed: %s", kind, term, type(exc).__name__)
+                log.warning("hf %s %r failed: %s: %s", kind, term,
+                            type(exc).__name__, exc)
     return list(seen.values())
 
 
@@ -250,7 +252,8 @@ async def crawl(store, which: str = "both", terms: list[str] | None = None,
                 try:
                     return await fn(client, store, item)
                 except Exception as exc:
-                    log.warning("%s failed: %s", fn.__name__, type(exc).__name__)
+                    log.warning("%s failed: %s: %s", fn.__name__,
+                                type(exc).__name__, exc)
                     return 0
 
         if which in ("both", "gitlab"):

@@ -147,7 +147,8 @@ async def main() -> int:
                         priority=130,
                     )
                 except Exception as exc:
-                    log.warning("Query %r failed: %s", q[:40], type(exc).__name__)
+                    log.warning("Query %r failed: %s: %s", q[:40],
+                                type(exc).__name__, exc)
                     continue
                 total_new += new
                 if new or i % 10 == 0:
