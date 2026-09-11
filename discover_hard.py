@@ -129,7 +129,14 @@ async def main() -> int:
                         q,
                         since=date(2021, 1, 1),
                         reason="discover-hard",
-                        priority=110,
+                        # Level with the other proven sources. The earlier
+                        # demotion to 110 targeted the broad `language:` and
+                        # `stars:` cross-products, which yielded 0.64
+                        # skills/repo and monopolised the queue. Those queries
+                        # are gone; what remains measured 87-90% productive, and
+                        # holding it below the sweep's reach starves the sweep
+                        # instead of protecting it.
+                        priority=130,
                     )
                 except Exception as exc:
                     log.warning("Query %r failed: %s", q[:40], type(exc).__name__)
