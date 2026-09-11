@@ -373,7 +373,17 @@ def score_skill(
         ("distinctiveness", distinct, w.distinctiveness),
     ])
     trust, trust_detail = trust_multiplier(repo, w)
-    score = round(100.0 * base * trust, 2)
+
+    # Safety is multiplicative for the same reason the other trust penalties
+    # are: a skill that instructs an agent to exfiltrate credentials must not
+    # be able to climb back past a safe one by being well-written.
+    from .safety import penalty as safety_penalty
+    level = (skill["risk_level"] if "risk_level" in skill.keys() else None) or "none"
+    safety = safety_penalty(level)
+    if safety < 1.0:
+        trust_detail = {**trust_detail, "safety": {"level": level,
+                                                   "factor": safety}}
+    score = round(100.0 * base * trust * safety, 2)
 
     return score, {
         "score": score,

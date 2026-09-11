@@ -294,6 +294,11 @@ class Store:
                 "category": "TEXT",
                 "subcategory": "TEXT",
                 "categories": "TEXT",
+                # What following this skill would instruct an agent to do.
+                # Defaults to 'none' so an un-assessed corpus behaves exactly
+                # as before rather than treating silence as suspicion.
+                "risk_level": "TEXT DEFAULT 'none'",
+                "risk_detail": "TEXT",
             },
             "repos": {
                 "discovered_via": "TEXT", "owner_type": "TEXT", "homepage": "TEXT",

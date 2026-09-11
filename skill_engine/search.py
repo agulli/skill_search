@@ -66,6 +66,7 @@ class Hit:
     content_hash: str = ""
     duplicates: int = 0
     author_score: float | None = None
+    risk: str = "none"
 
     @property
     def author(self) -> str:
@@ -129,10 +130,40 @@ def to_fts_query(raw: str, conjunctive: bool = False) -> str:
     return joiner.join(f'"{t}"*' if len(t) > 2 else f'"{t}"' for t in terms)
 
 
+def _risk_column(store) -> bool:
+    """Whether this database carries the safety columns.
+
+    An index built before safety assessment existed has no `risk_level`, and a
+    read-only store cannot be migrated — so referencing the column
+    unconditionally turns every query on an older artifact into an error.
+    Absent means *unassessed*, which is treated as unknown rather than unsafe.
+
+    Cached on the store itself rather than in a module dict keyed by id():
+    CPython reuses object ids after collection, so a keyed cache can answer for
+    a database that no longer exists — and the wrong answer here either breaks
+    every query or silently stops excluding unsafe skills.
+    """
+    cached = getattr(store, "_has_risk_column", None)
+    if cached is None:
+        cols = {r["name"] for r in store.db.execute("PRAGMA table_info(skills)")}
+        cached = "risk_level" in cols
+        try:
+            store._has_risk_column = cached
+        except AttributeError:          # a store that forbids new attributes
+            pass
+    return cached
+
+
 def _where(filters: dict[str, Any]) -> tuple[str, list[Any]]:
     clauses, params = [], []
     if filters.get("valid_only", True):
         clauses.append("s.valid = 1")
+    # Skills whose instructions have no legitimate reading — invisible Unicode
+    # carrying hidden text, explicit instruction override — are withheld from
+    # results. Applied here rather than by score so that no weighting change can
+    # reintroduce one. `include_unsafe` exists for auditing the exclusions.
+    if filters.get("_has_risk") and not filters.get("include_unsafe"):
+        clauses.append("COALESCE(s.risk_level, 'none') != 'critical'")
     if filters.get("min_stars"):
         clauses.append("r.stars >= ?")
         params.append(int(filters["min_stars"]))
@@ -181,7 +212,7 @@ def count_matches(store: Store, query: str, filters: dict | None = None) -> int:
     fts = to_fts_query(query, conjunctive=True)
     if not fts:
         return 0
-    where, params = _where(filters or {})
+    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store)})
     try:
         row = store.db.execute(
             f"""SELECT COUNT(*) c FROM skills_fts
@@ -225,7 +256,7 @@ def facet_counts(store: Store, query: str, filters: dict | None = None,
     fts = to_fts_query(query)
     if not fts:
         return {}
-    where, params = _where(filters or {})
+    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store)})
     try:
         rows = store.db.execute(
             f"""WITH m AS (
@@ -286,12 +317,17 @@ def _keyword_search(
     fts = to_fts_query(query, conjunctive=conjunctive)
     if not fts:
         return []
-    where, params = _where(filters or {})
+    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store)})
     weights = ",".join(str(w) for w in COLUMN_WEIGHTS)
+    # Projected only when present: an index predating safety assessment has no
+    # such column, and a read-only store cannot be migrated to add one.
+    risk_col = ("COALESCE(s.risk_level, 'none') AS risk_level,"
+                if _risk_column(store) else "'none' AS risk_level,")
 
     sql = f"""
         SELECT s.id, s.repo, s.path, s.name, s.description, s.source_kind,
                s.license, s.score, s.resources, s.content_hash, r.stars,
+               {risk_col}
                snippet(skills_fts, 2, '[', ']', ' … ', 18) AS snip,
                bm25(skills_fts, {weights}) AS bm25
         FROM skills_fts
@@ -314,6 +350,7 @@ def _keyword_search(
             content_hash=r["content_hash"] or "",
             snippet=(r["snip"] or "").replace("\n", " ")[:280],
             resources=json.loads(r["resources"] or "[]"),
+            risk=(r["risk_level"] if "risk_level" in r.keys() else None) or "none",
             matched_by="keyword",
         )
         for r in rows
@@ -340,11 +377,14 @@ def vector_search(
     encode_query = getattr(embedder, "encode_query", None)
     qvec = encode_query(query) if encode_query else embedder.encode([query])[0]
 
-    where, params = _where(filters or {})
+    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store)})
+    risk_col = ("COALESCE(s.risk_level, 'none') AS risk_level,"
+                if _risk_column(store) else "'none' AS risk_level,")
     rows = store.db.execute(
         f"""
         SELECT s.id, s.repo, s.path, s.name, s.description, s.source_kind,
-               s.license, s.score, s.resources, s.content_hash, r.stars, v.vec
+               s.license, s.score, s.resources, s.content_hash, r.stars,
+               {risk_col} v.vec
         FROM vectors v
         JOIN skills s ON s.id = v.skill_id
         JOIN repos  r ON r.full_name = s.repo
@@ -537,7 +577,7 @@ def category_counts(store: Store, filters: dict | None = None) -> dict[str, dict
     into the dark. One grouped pass over an indexed column answers the whole
     tree, so the landing page costs a single query.
     """
-    where, params = _where({**(filters or {}), "valid_only": True})
+    where, params = _where({**(filters or {}), "valid_only": True, "_has_risk": _risk_column(store)})
     try:
         rows = store.db.execute(
             f"""SELECT s.category AS c, s.subcategory AS sub, COUNT(*) AS n
@@ -568,7 +608,7 @@ def browse(store: Store, category: str, subcategory: str | None = None, *,
     collapsed and the per-repository cap applies here too — without them a
     category page is just one prolific repository fifteen times over.
     """
-    where, params = _where({**(filters or {}), "valid_only": True})
+    where, params = _where({**(filters or {}), "valid_only": True, "_has_risk": _risk_column(store)})
     clause = "s.category = ?"
     args: list[Any] = [category]
     if subcategory:
@@ -604,7 +644,8 @@ def browse(store: Store, category: str, subcategory: str | None = None, *,
             content_hash=r["content_hash"] or "",
             snippet=(r["description"] or "")[:240],
             resources=json.loads(r["resources"] or "[]"),
-            rank=r["score"], matched_by="browse")
+            rank=r["score"], matched_by="browse",
+              risk=(r["risk_level"] if "risk_level" in r.keys() else None) or "none")
         for r in rows
     ]
     deduped = list(collapse_duplicates({h.skill_id: h for h in hits}).values())

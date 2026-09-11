@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from skill_engine.ranking import recompute
+from skill_engine.safety import assess_corpus
 from skill_engine.store import Store
 from skill_engine.taxonomy import categorise_corpus
 
@@ -74,6 +75,13 @@ def main() -> int:
     print(f"    Completed in {time.time()-t:.0f}s")
 
     # 3. Compute corpus-relative quality rankings
+    t = log_step("Inspecting what each skill instructs an agent to do")
+    risk = assess_corpus(store)
+    counts = risk["counts"]
+    print(f"    " + ", ".join(f"{k} {v:,}" for k, v in sorted(counts.items())))
+    if counts.get("critical"):
+        print(f"    {counts['critical']:,} withheld from search")
+    print(f"    Completed in {time.time()-t:.0f}s")
     t = log_step("Computing corpus-calibrated quality scores")
     result = recompute(store)
     print(

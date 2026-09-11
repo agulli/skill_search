@@ -18,6 +18,8 @@ Available MCP Tools:
 from __future__ import annotations
 
 import argparse
+import json
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -81,6 +83,9 @@ def _hit(h: Hit) -> dict[str, Any]:
         "stars": h.stars,
         "license": h.license or "unspecified",
         "also_vendored_by": h.duplicates,
+        # Surfaced so the calling agent can decline rather than discovering the
+        # problem by executing it. Anything rated `critical` never reaches here.
+        "risk": getattr(h, "risk", "none"),
     }
 
 
@@ -137,15 +142,18 @@ def get_skill(repo: str, path: str) -> dict[str, Any]:
     """
     if not repo or not path:
         return {"error": "Both 'repo' and 'path' arguments are required"}
-    row = (
-        store()
-        .db.execute(
-            "SELECT name, description, body, license, score FROM skills "
-            "WHERE repo = ? AND path = ?",
-            (repo, path),
-        )
-        .fetchone()
-    )
+    base = "SELECT name, description, body, license, score"
+    try:
+        row = store().db.execute(
+            base + ", COALESCE(risk_level,'none') AS risk_level, risk_detail "
+            "FROM skills WHERE repo = ? AND path = ?", (repo, path)).fetchone()
+    except sqlite3.OperationalError:
+        # An index built before safety assessment existed. Absent means
+        # unassessed, which is reported as unknown rather than as safe — the
+        # agent should be able to tell the difference.
+        row = store().db.execute(
+            base + " FROM skills WHERE repo = ? AND path = ?",
+            (repo, path)).fetchone()
     if row is None:
         return {
             "error": f"Skill not found at {repo}/{path}",
@@ -159,6 +167,9 @@ def get_skill(repo: str, path: str) -> dict[str, Any]:
         "url": f"https://github.com/{repo}/blob/HEAD/{path}",
         "license": row["license"] or "unspecified",
         "quality": round(row["score"], 1),
+        "risk": (row["risk_level"] if "risk_level" in row.keys() else "unassessed"),
+        "risk_detail": json.loads(row["risk_detail"]) if (
+            "risk_detail" in row.keys() and row["risk_detail"]) else None,
         "body": row["body"],
     }
 
