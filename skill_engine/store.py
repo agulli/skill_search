@@ -250,6 +250,14 @@ class Store:
         self.db.execute(f"PRAGMA cache_size = -{cache_mb * 1024}")
         self.db.execute(f"PRAGMA mmap_size = {mmap_mb * 1024 * 1024}")
         self.db.execute("PRAGMA temp_store = MEMORY")
+        # Cap the write-ahead log. Without this the WAL is reused but never
+        # shrunk, and a long-lived reader blocks checkpointing entirely — an
+        # 8-hour discovery process and a concurrent sweep grew it to 33.7 GB,
+        # larger than the 27 GB database, at which point every write began
+        # failing with OperationalError. The limit is what a checkpoint
+        # truncates back to.
+        limit_mb = int(os.getenv("SKILL_ENGINE_WAL_LIMIT_MB", "512"))
+        self.db.execute(f"PRAGMA journal_size_limit = {limit_mb * 1024 * 1024}")
 
     def optimize(self) -> dict:
         """Compact the FTS index and refresh planner statistics.

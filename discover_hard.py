@@ -121,6 +121,14 @@ async def main() -> int:
     total_new = 0
     async with GitHubClient(cfg.tokens, concurrency=cfg.concurrency) as gh:
         for cycle in range(1, 100):
+            # Reopen per cycle. A connection held across cycles pins the WAL
+            # snapshot, so SQLite cannot checkpoint and the log grows without
+            # bound — measured at 33.7 GB after eight hours, which stopped
+            # writes entirely. Closing between cycles lets a checkpoint run.
+            if cycle > 1:
+                store.close()
+                store = Store(Path(DB))
+                store.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
             for i, q in enumerate(plan, 1):
                 try:
                     seen, new = await search_repos(
