@@ -135,6 +135,10 @@ def main() -> int:
                     help="also model N randomly chosen *unflagged* skills, to "
                          "estimate what the rule gate misses")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--topup", action="store_true",
+                    help="clear the recorded decision for any skill the *current* "
+                         "rules gate but which was never modelled, so a resumed "
+                         "run picks up only what new rules newly flagged")
     ap.add_argument("--redecide", action="store_true",
                     help="re-run only the fusion layer, from the model output "
                          "already stored; makes no model calls")
@@ -153,6 +157,37 @@ def main() -> int:
 
     if args.redecide:
         return redecide(store)
+
+    if args.topup:
+        # Adding a rule re-gates the corpus, and the rows it newly flags are
+        # already marked `allow` at zero confidence by the previous pass's
+        # closing statement — so `--resume` skips exactly the skills the new
+        # rule was written to catch. Clearing their decision, and only theirs,
+        # turns a five-hour re-run into modelling the difference.
+        cleared = 0
+        cur = store.db.execute(
+            "SELECT id, name, description, body, allowed_tools, path "
+            "FROM skills WHERE valid = 1 AND risk_analysis IS NULL "
+            "  AND risk_confidence IS NOT NULL")
+        while True:
+            chunk = cur.fetchmany(2000)
+            if not chunk:
+                break
+            for r in chunk:
+                try:
+                    tools = json.loads(r["allowed_tools"] or "[]")
+                except Exception:
+                    tools = []
+                v = inspect(r["name"] or "", r["description"] or "",
+                            r["body"] or "", tools, r["path"] or "")
+                if v.level in GATED_LEVELS:
+                    store.db.execute(
+                        "UPDATE skills SET risk_confidence = NULL WHERE id = ?",
+                        (r["id"],))
+                    cleared += 1
+        store.commit()
+        log.info("top-up: %d skills are gated by the current rules and were "
+                 "never modelled; their decision has been cleared", cleared)
 
     use_model = not args.no_model
     if use_model and not available():

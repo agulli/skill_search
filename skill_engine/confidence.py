@@ -285,6 +285,37 @@ def decide(verdict, analysis=None) -> Decision:
     # And the outcome is `flag`, not `allow`: the skill is demoted and the
     # reason is disclosed through the API, so a calling agent still learns what
     # it is asking for.
+    # --- the rules must have found something for a skill to be removed
+    #
+    # A block whose only evidence is a 9B local model's unaided opinion is the
+    # weakest evidence in the system supporting its strongest action. The audit
+    # sample caught this on its first run: `git-ship`, a Chinese-language
+    # one-click Git workflow tool, was blocked at 95% on `harm: severe` with a
+    # rule level of `none`. It automates branch, commit, PR and squash-merge
+    # without asking at each step, and says so plainly — an aggressive power
+    # tool, honestly described, not an attack. The model read autonomous git
+    # operations as severe harm.
+    #
+    # So an unprimed model judgement can still *act*, which is what keeps the
+    # audit sample useful — a rule-clean skill the model calls harmful is the
+    # only signal that the gate has a hole — but it acts by flagging. Removal
+    # requires that the deterministic layer found something too.
+    #
+    # This does not weaken the governing rule, it sharpens it: the model
+    # escalates into the flag tier on its own, and into the block tier only
+    # alongside the rules.
+    if d.action == BLOCK and verdict.level in (NONE, LOW):
+        d.action = FLAG
+        d.basis = f"{basis}_model_only"
+        d.reasons.append("the rules found nothing: flagged for review rather "
+                         "than withheld, on the model's judgement alone")
+
+    # Currently a backstop rather than a live path: the two rules above —
+    # corroboration for a primed harm, and removal requiring a rule finding —
+    # already land honest dual-use tooling on `flag` before this is reached.
+    # It is kept because it is what holds if a precision figure is ever revised
+    # upward, and noted so that nobody spends an afternoon working out why it
+    # never fires.
     declared = "declared_offensive_purpose" in (verdict.capabilities or [])
     if d.action == BLOCK and verdict.level != CRITICAL and not mismatch and declared:
         d.action = FLAG

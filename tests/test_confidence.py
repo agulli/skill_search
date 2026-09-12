@@ -114,16 +114,32 @@ def test_a_primed_harm_alone_does_not_block():
     assert d.action == FLAG and d.basis == "rule_medium_alone"
 
 
-def test_an_unprimed_harm_still_blocks_on_its_own():
-    """The audit sample's entire purpose.
+def test_an_unprimed_harm_acts_but_only_by_flagging():
+    """The audit sample must be able to act, but not to remove.
 
-    Nothing in the prompt primes the model on a rule-clean skill, so
-    volunteering "severe" is unprompted — and it is the only signal that the
-    rule gate has a hole. Measured at 0 false positives on 149 clean skills.
+    Nothing primes the model on a rule-clean skill, so volunteering "severe" is
+    unprompted and is the only signal that the rule gate has a hole — it has to
+    do *something*. But a block whose only evidence is a 9B local model's
+    unaided opinion is the weakest evidence in the system supporting its
+    strongest action, and the audit sample proved it on its first run:
+    `git-ship`, a one-click Git workflow tool that automates branch, commit, PR
+    and squash-merge without asking at each step and says so plainly, was
+    blocked at 95% with a rule level of `none`.
     """
     for level in (NONE, LOW):
         d = decide(Verdict(level=level), FakeAnalysis(harm="severe"))
-        assert d.action == BLOCK, level
+        assert d.action == FLAG, level
+        assert d.confidence >= 0.9, "the signal is still reported in full"
+        assert "the rules found nothing" in " ".join(d.reasons)
+
+
+def test_removal_requires_the_rules_to_have_found_something():
+    """The same model output, with and without a deterministic finding."""
+    model_only = decide(Verdict(level=NONE), FakeAnalysis(harm="severe"))
+    corroborated = decide(Verdict(level=HIGH),
+                          FakeAnalysis(harm="severe", mismatch=True))
+    assert model_only.action == FLAG
+    assert corroborated.action == BLOCK
 
 
 def test_agreement_is_more_confident_than_the_rules_alone():
@@ -178,15 +194,19 @@ class Verdicts:
         return Verdict(level=level, capabilities=["declared_offensive_purpose"])
 
 
-def test_declared_offensive_tooling_is_flagged_not_blocked():
+def test_declared_offensive_tooling_ends_up_flagged():
     """`hunt-rce`: 'built from 67 public bug bounty reports', body matches.
 
-    Reachable where the model was not primed by a rule hit, which is where an
-    unsupported block would otherwise land on honest tooling.
+    Two later rules — corroboration for a primed harm, and removal requiring a
+    rule finding — now reach this outcome before the dual-use demotion does, so
+    the test asserts the outcome rather than the path that produced it. The
+    demotion branch is kept as a backstop: it is what holds if a precision
+    figure is ever revised upward.
     """
-    d = decide(Verdicts.offensive(LOW), FakeAnalysis(harm="severe"))
-    assert d.action == FLAG
-    assert "demoted and disclosed" in " ".join(d.reasons)
+    for level in (LOW, MEDIUM, HIGH):
+        d = decide(Verdicts.offensive(level), FakeAnalysis(harm="severe"))
+        assert d.action == FLAG, level
+        assert "offensive-security purpose" in " ".join(d.reasons), level
 
 
 def test_a_declared_purpose_is_disclosed_even_without_the_demotion():
@@ -245,11 +265,15 @@ def test_a_mismatch_with_no_harm_does_not_block():
 
 
 def test_a_mismatch_with_harm_still_blocks():
-    """The two labelled attacks that triggered mismatch both said severe."""
-    d = decide(Verdict(level=NONE), FakeAnalysis(mismatch=True, harm="severe"))
+    """The two labelled attacks that triggered mismatch both said severe.
+
+    At `high`, where the rules also found something — `exfil-body` is the real
+    case, and it is the one attack that depends on this path.
+    """
+    d = decide(Verdict(level=HIGH), FakeAnalysis(mismatch=True, harm="severe"))
     assert d.action == BLOCK
 
 
 def test_a_mismatch_with_minor_harm_is_enough():
-    d = decide(Verdict(level=NONE), FakeAnalysis(mismatch=True, harm="minor"))
+    d = decide(Verdict(level=MEDIUM), FakeAnalysis(mismatch=True, harm="minor"))
     assert d.action == BLOCK and d.basis == "model_mismatch_alone"

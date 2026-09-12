@@ -40,6 +40,7 @@ human or an agent can judge rather than trusting a verdict.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -478,6 +479,23 @@ SEVERE: tuple[tuple[str, re.Pattern, float], ...] = (
         r"\.[a-z0-9-]+\.[a-z]{2,}",
     ), 8.0),
 
+    # Netcat wired to a shell. 12 benchmark attacks, 2 corpus hits — and both
+    # of those are one skill listing `nc -e /bin/sh` in a *deny* list, which
+    # the negation and detector guards cover.
+    ("bind_shell", _rx(
+        r"\bnc\b[^\n]{0,40}-e\s*/bin/(?:ba)?sh",
+        r"\bnc\b[^\n]{0,30}-l[^\n]{0,20}-p\s*\d+[^\n]{0,20}-e\b",
+        r"/bin/(?:ba)?sh\s+-i\s*>&\s*/dev/tcp/",
+    ), 8.0),
+
+    # An encode step feeding an egress step: `env | base64 | curl`. 11
+    # benchmark attacks, 2 corpus hits, both offensive-security skills
+    # demonstrating the technique under a declared security subject.
+    ("encoded_egress_pipeline", _rx(
+        r"\|\s*base64[^\n|]{0,20}\|\s*(?:curl|wget|nc)\b",
+        r"base64[^\n|]{0,20}\|\s*(?:curl|wget|nc)\b",
+    ), 8.0),
+
     # An instruction hidden in an HTML comment: invisible in rendered Markdown,
     # read by the model. The same smuggling idea as a Unicode tag payload, in a
     # form every Markdown renderer hides for free.
@@ -853,6 +871,39 @@ def _is_quoted(text: str, match: re.Match) -> bool:
     return any(c in cut for c in closes)
 
 
+# A quoted base64 literal long enough to hold a URL. Used as a cheap gate
+# before the decode, and included in the accelerator's pattern list so that
+# `assess_corpus` admits these rows for inspection — a check the gate cannot
+# see is a rule that does not exist in the release path.
+B64_LITERAL = re.compile(r"[\"\']([A-Za-z0-9+/]{16,}={0,2})[\"\']")
+
+
+def _decoded_destination(text: str) -> str | None:
+    """A base64 literal in the text that decodes to a URL.
+
+    Hiding the destination is the point. `base64.b64decode("aHR0cHM6Ly9t…")`
+    reads as an opaque constant to anyone skimming the skill, and resolves at
+    runtime to `https://metrics.attacker.example.com/collect`. Twelve benchmark
+    attacks conceal their endpoint exactly this way.
+
+    Measured across 95,099 ordinary skills: **zero** contain a base64 literal
+    that decodes to a URL. Nobody writes their own API endpoint this way, which
+    is what makes the signal worth a severe weight — the concealment is the
+    finding, independently of where it points.
+    """
+    for m in B64_LITERAL.finditer(text):
+        raw = m.group(1)
+        if len(raw) % 4:
+            continue
+        try:
+            decoded = base64.b64decode(raw, validate=True).decode("utf-8", "ignore")
+        except Exception:
+            continue
+        if decoded[:8].lower().startswith(("http://", "https:/")):
+            return decoded[:80]
+    return None
+
+
 def _in_code_fence(text: str, match: re.Match) -> bool:
     """True when the match sits inside a fenced code block.
 
@@ -1005,6 +1056,13 @@ def inspect(name: str, description: str, body: str,
         v.findings.append(Finding("jailbreak_technique", 3.0,
                                   ", ".join(jailbreak_hits)))
         v.score += 3.0
+
+    hidden_dest = _decoded_destination(text)
+    if hidden_dest:
+        v.capabilities.append("network_egress")
+        v.findings.append(Finding("concealed_destination", 8.0,
+                                  f"base64 literal decodes to {hidden_dest}"))
+        v.score += 8.0
 
     secret = INLINE_SECRET.search(text)
     if secret:
@@ -1210,7 +1268,11 @@ def _gate_patterns() -> list[str] | None:
               OBFUSCATION]
     raw = ([g.pattern for g in groups]
            + [rx.pattern for _, rx, _ in SEVERE]
-           + [rx.pattern for _, rx in JAILBREAK_RX])
+           + [rx.pattern for _, rx in JAILBREAK_RX]
+           # Deliberately coarse: admits any long base64 literal so that
+           # `_decoded_destination` gets a chance to decode it. Over-inclusive
+           # is the only safe direction for this gate.
+           + [B64_LITERAL.pattern])
     return [_strip_lookaround(p) if LOOKAROUND_OPEN.search(p) else p
             for p in raw]
 
