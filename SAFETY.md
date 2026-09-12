@@ -233,6 +233,30 @@ Two narrower tests replaced the requirement:
   instruction. Parity over the delimiters on the line answers the real
   question.
 
+### Two things measured and deliberately not done
+
+**Extending the gate to the `low` band.** 1,323 skills carry some signal
+without reaching the review gate, and that is where a miss is likeliest, so it
+looked like the obvious next move. Sixty of them were drawn at random and
+modelled: **0 were actionable.** Extending the gate downward would cost roughly
+twelve hours of local inference per pass for an expected yield near zero, so
+the boundary stays at `medium`. Stated honestly, 0/60 has a one-sided 95% upper
+bound near 5%, so up to ~65 of the band could be actionable — the expected
+yield is low, not nil.
+
+**Flagging a bundled executable.** Four benchmark fixtures put the payload in a
+bundled file and keep the SKILL.md innocuous — "Run the bundled script to
+begin", "Run `setup.bat` once before using the skill". The prose form was
+measured first: 135 corpus hits against 3 catches, because "run the bundled
+script" is ordinary phrasing. The structural form looked more promising, since
+the index records each skill's resource filenames — but 127 skills bundle a
+`.ps1`, `.bat` or `.exe`, **none of them in a `/malicious/` path**, and the
+fixtures themselves record no resources at all. 0 catches against 127 hits.
+
+That class is genuinely out of reach from the index as it stands: the payload
+lives in a file whose *content* is never crawled. Closing it needs resource
+inspection in the crawler, not another rule in the gate.
+
 ### The pre-gate had gone under-inclusive
 
 `assess_corpus` — the path `release.py` uses — runs the rules only on rows the
@@ -242,10 +266,22 @@ and not to the gate's pattern list, so the 98-character anti-refusal attack was
 passed over untouched. Nothing failed and nothing logged: the rule simply did
 not exist in the release path.
 
-This is the failure mode a pre-gate has, and it is silent by construction, so
-`tests/test_gate.py` now asserts the gate admits one representative of every
-rule family. Re-verified across the corpus afterwards: the gate selects 8,166
-of 95,725 rows, and **zero** rejected rows would have been flagged.
+This is the failure mode a pre-gate has, and it is silent by construction — so
+it happened again. A later round added `sysprompt_extraction`,
+`universal_trigger_claim` and `secret_encoding` to `CAPABILITY_RULES`, and the
+gate's pattern list hand-enumerated individual regexes, so the new capabilities
+were never included. A corpus sweep found three rows the gate rejected that the
+rules would have flagged.
+
+The first test written for this checked one representative of every rule family
+from a list written by hand, and that list is precisely what did not grow. The
+patterns are now **derived from the rule tables**, and the test walks those
+tables rather than a list: every severe construct and every capability has a
+string on record that it matches, and the gate must admit a row containing it.
+A rule added to a table cannot escape either.
+
+Re-verified across the corpus after each change: the gate selects 14,842 of
+95,725 rows, and zero rejected rows would have been flagged.
 
 ### What remains open, and why that is acceptable
 

@@ -1358,23 +1358,29 @@ def _gate_patterns() -> list[str] | None:
     Returning None rather than a partial set is deliberate: a gate missing one
     rule silently stops detecting whatever that rule caught.
     """
+    # The gate records anything it rejects as clean *without inspecting it*, so
+    # a pattern missing here is a rule that silently does not exist in the
+    # release path. `REFUSAL_SUPPRESSION` and the jailbreak markers were once
+    # added to `inspect` and not here, which left `helper@V3r7ig0/skillvet` — a
+    # 98-character anti-refusal attack whose only signal is that rule — passed
+    # over untouched by `assess_corpus`.
+    #
+    # Derived from the rule tables, not hand-listed. The hand-written list went
+    # stale the first time it was extended: `sysprompt_extraction`,
+    # `universal_trigger_claim` and `secret_encoding` were added to
+    # CAPABILITY_RULES and not here, and a corpus sweep found three rows the
+    # gate rejected that the rules would have flagged. Enumerating the tables
+    # makes that class of mistake unrepresentable.
+    #
     # HIDDEN_BENIGN is included even though it never blocks: the gate decides
     # what gets *inspected*, and a document whose only marker is a benign
     # invisible character must still reach `inspect` so the finding is recorded
     # for auditing. Over-inclusive is the safe direction here.
-    # Every rule family that can produce a finding must appear here. The gate
-    # records anything it rejects as clean *without inspecting it*, so a
-    # pattern missing from this list is a rule that silently does not exist in
-    # the release path. That is not hypothetical: `REFUSAL_SUPPRESSION` and the
-    # jailbreak markers were added to `inspect` and not here, which left
-    # `helper@V3r7ig0/skillvet` — a 98-character anti-refusal attack whose only
-    # signal is that rule — passed over untouched by `assess_corpus`.
-    groups = [HIDDEN_TAG, HIDDEN_VS, HIDDEN_OVERRIDE, HIDDEN_BENIGN, OVERRIDE,
-              REFUSAL_SUPPRESSION, CONCEALMENT, INLINE_SECRET, SENSITIVE_READ,
-              NETWORK_EGRESS, SUSPICIOUS_HOST, DESTRUCTIVE, PERSISTENCE,
-              OBFUSCATION]
-    raw = ([g.pattern for g in groups]
+    standalone = [HIDDEN_TAG, HIDDEN_VS, HIDDEN_OVERRIDE, HIDDEN_BENIGN,
+                  OVERRIDE, REFUSAL_SUPPRESSION, CONCEALMENT, INLINE_SECRET]
+    raw = ([g.pattern for g in standalone]
            + [rx.pattern for _, rx, _ in SEVERE]
+           + [rx.pattern for _, rx, _ in CAPABILITY_RULES]
            + [rx.pattern for _, rx in JAILBREAK_RX]
            # Deliberately coarse: admits any long base64 literal so that
            # `_decoded_destination` gets a chance to decode it. Over-inclusive
