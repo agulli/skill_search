@@ -137,6 +137,103 @@ OVERRIDE = _rx(
     r"override\s+(?:your\s+)?safety\s+(?:guidelines|rules|protocol)",
 )
 
+# Instructions that suppress the agent's own refusal behaviour. A distinct
+# attack class from OVERRIDE: nothing here mentions previous instructions, it
+# simply tells the agent to comply with everything — and the corpus contained a
+# labelled attack (`helper@V3r7ig0/skillvet`, a 98-character anti-refusal
+# fixture) that every other rule rated clean.
+#
+# The universal quantifier is what makes this safe to block on. Measured over
+# 95,725 skills, the loose form — "do not refuse the request" — matched 5
+# skills of which only 2 were attacks: "Do NOT refuse the user; adjust the
+# framing" and "don't refuse the task" are ordinary instructions to be helpful.
+# Requiring "any/every/all" separates them perfectly: 2 hits, both genuine.
+#
+# Deliberately excluded, having measured them: "do not add warnings or
+# disclaimers" (9 hits, 6 of them ordinary copywriting style guidance) and
+# anything matching "without warnings" (133 hits, none of them attacks — it is
+# how people describe a clean compile).
+REFUSAL_SUPPRESSION = _rx(
+    r"(?:never|must\s+never|do\s+not\s+ever)\s+refuse\s+(?:any|every|all)\b",
+    r"(?:must\s+)?always\s+comply\s+with\s+(?:any|all|every)\b",
+    r"must\s+always\s+comply\s+and\s+never\s+refuse",
+    r"you\s+(?:are|act)\s+(?:as\s+)?an?\s+unrestricted\s+(?:root\s+)?agent",
+)
+
+# Tooling whose purpose is defeating a model's safety training. A distinct
+# class again: it does not attack whoever runs it, so nothing above fires, and
+# the corpus contains a working example — `godmode`, offering "33 techniques to
+# evade input-side safety classifiers" and a config for persistent
+# jailbreaking.
+#
+# The word "jailbreak" is worthless as a signal: 55 skills mention it in their
+# name or description and nearly all are defensive (jailbreak *detection*,
+# jailbreak *resistance* testing, even iOS jailbreak detection). What separates
+# tooling from commentary is **how many of these specific techniques co-occur**.
+# Measured across 95,725 skills, the distribution has an empty middle:
+#
+#     7 markers    3 rows    godmode and its two vendored copies
+#     2 markers    1 row     prompt-injection-tester (a labelled attack)
+#     1 marker    26 rows    all defensive or incidental — CTF notes, a
+#                            blue-team playbook, threat-model tables, garak
+#                            and PyRIT documentation
+#
+# Nothing lies between 2 and 7, so a threshold of 3 separates the classes with
+# no judgement call, and a single mention can never trip it. Honest limit: the
+# blocking side of that measurement is one distinct document. If a legitimate
+# catalogue of techniques ever reaches three, `review_blocks.py` is how it gets
+# cleared — which is the case this gate's override path exists for.
+JAILBREAK_MARKERS = (
+    ("bypass_filters",
+     r"bypass(?:ing)?\s+(?:the\s+|your\s+)?(?:safety|content|moderation)"
+     r"\s+(?:filters?|classifiers?|guardrails?)"),
+    ("evade_classifiers",
+     r"evade\s+(?:\w+[- ]){0,3}(?:safety|content|moderation)\s+classifiers?"),
+    ("persistent_jailbreak",
+     r"persistent\s+jailbreak\w*|jailbreak\w*\s+(?:persistence|config)"),
+    ("refusal_inversion", r"refusal\s+(?:suppression|inversion|bypass)"),
+    ("obfuscate_triggers", r"obfuscat\w+\s+(?:the\s+)?trigger\s+words?"),
+    ("prefill_attack", r"prefill\s+(?:engineering|attack|injection)"),
+    ("leetspeak_evasion", r"leetspeak|homoglyph\w*\s+substitution"),
+    ("dan_mode", r"\bDAN\s+(?:mode|prompt|jailbreak)|\bdeveloper\s+mode\s+jailbreak"),
+)
+JAILBREAK_RX = tuple((label, re.compile(pat, re.I))
+                     for label, pat in JAILBREAK_MARKERS)
+JAILBREAK_MIN = 3
+
+# The findings that have no legitimate reading, and therefore the only ones
+# that can remove a skill from the index. Everything else accumulates towards
+# HIGH at worst. Named as a set because the level logic must test *scored*
+# findings rather than raw regex matches — see the comment in `inspect`.
+# An openly declared offensive-security purpose, read from the name and
+# description only — the part a person sees before installing a skill.
+#
+# This exists to separate honest dual-use tooling from disguised attacks. A
+# penetration-testing skill that says it transfers files off a host, and an
+# attack disguised as a weather assistant, contain the same techniques; the
+# difference is whether the user was told. 956 of 95,725 skills (1.0%) declare
+# a purpose from this vocabulary, and none of the 17 labelled attacks do.
+#
+# Deliberately read from the *header*, never the body: an attacker who wants
+# the benefit of this signal has to advertise the capability where the user
+# chooses the skill, which defeats the disguise that made the attack work.
+DECLARED_OFFENSIVE = _rx(
+    r"pen(?:etration)?[- ]test\w*|pentest\w*",
+    r"red[- ]team\w*|adversary\s+(?:emulation|simulation)",
+    r"bug\s?bounty|vulnerability\s+(?:hunting|research)",
+    r"\bCTF\b|capture[- ]the[- ]flag",
+    r"offensive\s+security|post[- ]exploitation|exploit\s+development",
+    r"living[- ]off[- ]the[- ]land|exfiltrat\w+",
+)
+
+UNAMBIGUOUS_MARKERS = frozenset({
+    "hidden_unicode_payload",
+    "bidi_override",
+    "instruction_override",
+    "refusal_suppression",
+    "jailbreak_tooling",
+})
+
 # Concealment phrasing, scored but never sufficient for `critical` on its own.
 # "without asking the user" is the giveaway: in agent workflows it almost always
 # means "proceed autonomously rather than prompting at each step", which is
@@ -493,6 +590,27 @@ def inspect(name: str, description: str, body: str,
     elif override:
         # Recorded, not scored: useful when reviewing why something was cleared.
         v.findings.append(Finding("override_discussed", 0.0, _evidence(override)))
+    refusal = REFUSAL_SUPPRESSION.search(text)
+    if refusal and not _is_discussed(text, refusal) and not _is_quoted(text, refusal):
+        v.findings.append(Finding("refusal_suppression", 10.0, _evidence(refusal)))
+        v.score += 10.0
+    elif refusal:
+        v.findings.append(Finding("refusal_suppression_discussed", 0.0,
+                                  _evidence(refusal)))
+
+    jailbreak_hits = [label for label, rx in JAILBREAK_RX if rx.search(text)]
+    jailbreak = len(jailbreak_hits) >= JAILBREAK_MIN
+    if jailbreak:
+        v.findings.append(Finding("jailbreak_tooling", 10.0,
+                                  ", ".join(jailbreak_hits)))
+        v.score += 10.0
+    elif len(jailbreak_hits) == 2:
+        # Two techniques is not a toolkit, but it is not commentary either.
+        v.capabilities.append("jailbreak_technique")
+        v.findings.append(Finding("jailbreak_technique", 3.0,
+                                  ", ".join(jailbreak_hits)))
+        v.score += 3.0
+
     secret = INLINE_SECRET.search(text)
     if secret:
         # Truncated deliberately: a live credential should not be copied into
@@ -508,6 +626,8 @@ def inspect(name: str, description: str, body: str,
         v.score += 3.0
 
     security_subject = bool(SECURITY_CONTEXT.search(f"{name} {description} {path}"))
+    if DECLARED_OFFENSIVE.search(f"{name} {description}"):
+        v.capabilities.append("declared_offensive_purpose")
 
     # --- severe constructs, judged on their own
     for label, rx, weight in SEVERE:
@@ -558,7 +678,19 @@ def inspect(name: str, description: str, body: str,
             v.score += 2.5
 
     severe_hit = any(f.rule in {r[0] for r in SEVERE} for f in v.findings)
-    if (hidden or override) and v.score >= 10.0:
+
+    # Tested against the findings that were actually *scored*, not against the
+    # regex matches. The first version asked `if (hidden or override) and
+    # score >= 10`, where `override` was the match object — still truthy after
+    # a context guard had ruled the phrase discussed and zeroed its weight. So
+    # a skill containing a quoted or defensively-described override phrase,
+    # plus 10 points from anywhere else, was promoted to CRITICAL and removed
+    # from the index: the guard suppressed the score and the match unlocked the
+    # block anyway. `offensive-initial-access`, hand-labelled legitimate, was
+    # critical for exactly this reason.
+    marker = any(f.rule in UNAMBIGUOUS_MARKERS and f.weight > 0
+                 for f in v.findings)
+    if marker and v.score >= 10.0:
         v.level = CRITICAL
     elif severe_hit and _corroborated(v):
         # Deliberately capped at HIGH rather than CRITICAL. Only the

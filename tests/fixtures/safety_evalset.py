@@ -10,8 +10,6 @@ ATTACKS = {
  "shell-super-agent@agent-contracts/skill-preflight",
  "MessySkill@alinotfoundbtw/sounding",
  "weather-assistant@cisco-ai-defense/skill-scanner",
- "negative@domehahn/skil",
- "positive@domehahn/skil",
  "unicode-deception@domehahn/skil",
  "prompt-injection-tester@fevziegeyurtsevenler/llm-security-skills",
  "hidden-unicode-instruction@handcraftedbygod/SkillTrace",
@@ -45,4 +43,14 @@ BENIGN = {
  "cm-codeintell@tody-agent/codymaster",
  # Legitimate red-team tooling, honestly described.
  "offensive-initial-access@SnailSploit/Claude-Red",
+ # Scanner fixtures with empty descriptions. Mislabelled as attacks in the
+ # first version of this file — they live in `domehahn/skil` beside two real
+ # attacks (`unicode-deception`, `scanner-torture-skill`) and were swept in by
+ # association rather than by reading them. Both are fixtures for an
+ # *abandoned-dependency* check: "Python project that depends on actively
+ # maintained packages". Nothing malicious, and nothing that mentions safety
+ # at all. The recall figure reported before this correction was measured
+ # against those bad labels.
+ "negative@domehahn/skil",
+ "positive@domehahn/skil",
 }
