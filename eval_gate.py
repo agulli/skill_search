@@ -36,7 +36,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from fixtures.safety_evalset import ATTACKS, BENIGN          # noqa: E402
-from skill_engine.safety import CRITICAL, HIGH, MEDIUM, NONE, inspect  # noqa: E402
+from skill_engine.safety import (CRITICAL, HIGH, MEDIUM, NONE,  # noqa: E402
+                                 _row_metadata, inspect)
 from skill_engine.store import Store                          # noqa: E402
 
 GATED = (CRITICAL, HIGH, MEDIUM)
@@ -48,7 +49,8 @@ def verdict_for(store, row):
     except Exception:
         tools = []
     return inspect(row["name"] or "", row["description"] or "",
-                   row["body"] or "", tools, row["path"] or "")
+                   row["body"] or "", tools, row["path"] or "",
+                   _row_metadata(row))
 
 
 def lookup(store, key):
@@ -152,8 +154,8 @@ def main() -> int:
     print(f"\n  independent benchmark (skills under a '/malicious/' path)")
     print("  " + "-" * 74)
     bench = store.db.execute(
-        "SELECT name, repo, description, body, allowed_tools, path FROM skills "
-        "WHERE path LIKE '%/malicious/%' AND valid = 1").fetchall()
+        "SELECT name, repo, description, body, allowed_tools, path, metadata "
+        "FROM skills WHERE path LIKE '%/malicious/%' AND valid = 1").fetchall()
     levels: Counter = Counter()
     below = []
     for row in bench:
@@ -179,7 +181,7 @@ def main() -> int:
     counts: Counter = Counter()
     criticals = []
     cur = store.db.execute(
-        "SELECT name, repo, description, body, allowed_tools, path "
+        "SELECT name, repo, description, body, allowed_tools, path, metadata "
         "FROM skills WHERE valid = 1")
     seen = 0
     while True:

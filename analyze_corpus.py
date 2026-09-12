@@ -39,7 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from skill_engine import overrides
 from skill_engine.analyze import analyze, available
 from skill_engine.confidence import ALLOW, BLOCK, FLAG, decide, explain
-from skill_engine.safety import CRITICAL, HIGH, LOW, MEDIUM, NONE, inspect
+from skill_engine.safety import (CRITICAL, HIGH, LOW, MEDIUM, NONE,
+                                 _row_metadata, inspect)
 from skill_engine.store import Store
 
 log = logging.getLogger("analyze")
@@ -63,7 +64,7 @@ def redecide(store: Store) -> int:
     """
     rows = store.db.execute(
         "SELECT id, name, repo, description, body, allowed_tools, path, "
-        "       risk_analysis FROM skills "
+        "       metadata, risk_analysis FROM skills "
         "WHERE risk_analysis IS NOT NULL").fetchall()
     log.info("re-deciding %d stored analyses; no model calls", len(rows))
 
@@ -79,7 +80,8 @@ def redecide(store: Store) -> int:
         except Exception:
             tools = []
         v = inspect(r["name"] or "", r["description"] or "",
-                    r["body"] or "", tools, r["path"] or "")
+                    r["body"] or "", tools, r["path"] or "",
+                    _row_metadata(r))
 
         a = StoredAnalysis(raw) if raw.get("ok") else None
         d = decide(v, a)
@@ -166,7 +168,7 @@ def main() -> int:
         # turns a five-hour re-run into modelling the difference.
         cleared = 0
         cur = store.db.execute(
-            "SELECT id, name, description, body, allowed_tools, path "
+            "SELECT id, name, description, body, allowed_tools, path, metadata "
             "FROM skills WHERE valid = 1 AND risk_analysis IS NULL "
             "  AND risk_confidence IS NOT NULL")
         while True:
@@ -179,7 +181,8 @@ def main() -> int:
                 except Exception:
                     tools = []
                 v = inspect(r["name"] or "", r["description"] or "",
-                            r["body"] or "", tools, r["path"] or "")
+                            r["body"] or "", tools, r["path"] or "",
+                            _row_metadata(r))
                 if v.level in GATED_LEVELS:
                     store.db.execute(
                         "UPDATE skills SET risk_confidence = NULL WHERE id = ?",
@@ -195,7 +198,8 @@ def main() -> int:
         use_model = False
 
     sql = ("SELECT id, name, repo, description, body, allowed_tools, path, "
-           "       content_hash, risk_confidence FROM skills WHERE valid = 1")
+           "       metadata, content_hash, risk_confidence "
+           "FROM skills WHERE valid = 1")
     if args.limit:
         sql += f" LIMIT {args.limit}"
 
@@ -225,7 +229,8 @@ def main() -> int:
         except Exception:
             tools = []
         v = inspect(r["name"] or "", r["description"] or "",
-                    r["body"] or "", tools, r["path"] or "")
+                    r["body"] or "", tools, r["path"] or "",
+                    _row_metadata(r))
         if v.level in GATED_LEVELS:
             verdicts[r["id"]] = v
             gated.append(r)
