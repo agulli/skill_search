@@ -91,10 +91,39 @@ def test_rule_critical_blocks_even_when_the_model_sees_nothing():
 
 
 def test_the_model_can_escalate_what_the_rules_only_suspected():
-    """Where the model adds recall the rules do not have."""
+    """Where the model adds recall the rules do not have.
+
+    On a gated skill the escalation needs corroboration, because the prompt
+    tells the model which patterns the scan flagged — so agreement is partly
+    priming. A reported mismatch is evidence the model formed independently.
+    """
     assert decide(Verdict(level=MEDIUM), None).action == FLAG
     assert decide(Verdict(level=MEDIUM),
-                  FakeAnalysis(harm="severe")).action == BLOCK
+                  FakeAnalysis(harm="severe", mismatch=True)).action == BLOCK
+
+
+def test_a_primed_harm_alone_does_not_block():
+    """`overleap`, an Overleaf sync tool, blocked on its own OVERLEAF_COOKIE.
+
+    The model answered `harm: severe` with `mismatch: False` while its own
+    extracted actions read "check for prerequisites (Node.js >= 18, git)" — a
+    severity its extraction does not support, on a skill whose rule hit had
+    already been shown to it.
+    """
+    d = decide(Verdict(level=MEDIUM), FakeAnalysis(harm="severe", addressed=True))
+    assert d.action == FLAG and d.basis == "rule_medium_alone"
+
+
+def test_an_unprimed_harm_still_blocks_on_its_own():
+    """The audit sample's entire purpose.
+
+    Nothing in the prompt primes the model on a rule-clean skill, so
+    volunteering "severe" is unprompted — and it is the only signal that the
+    rule gate has a hole. Measured at 0 false positives on 149 clean skills.
+    """
+    for level in (NONE, LOW):
+        d = decide(Verdict(level=level), FakeAnalysis(harm="severe"))
+        assert d.action == BLOCK, level
 
 
 def test_agreement_is_more_confident_than_the_rules_alone():
@@ -150,16 +179,39 @@ class Verdicts:
 
 
 def test_declared_offensive_tooling_is_flagged_not_blocked():
-    """`hunt-rce`: 'built from 67 public bug bounty reports', body matches."""
+    """`hunt-rce`: 'built from 67 public bug bounty reports', body matches.
+
+    Reachable where the model was not primed by a rule hit, which is where an
+    unsupported block would otherwise land on honest tooling.
+    """
+    d = decide(Verdicts.offensive(LOW), FakeAnalysis(harm="severe"))
+    assert d.action == FLAG
+    assert "demoted and disclosed" in " ".join(d.reasons)
+
+
+def test_a_declared_purpose_is_disclosed_even_without_the_demotion():
+    """The fact is what a caller needs, whatever produced the action.
+
+    Requiring corroboration for a primed harm meant `hunt-rce` stopped going
+    through the demotion path — and silently lost the useful half of its
+    disclosure, leaving "rules: severe construct", which tells a reader nothing
+    about what they are looking at.
+    """
     d = decide(Verdicts.offensive(HIGH), FakeAnalysis(harm="severe"))
     assert d.action == FLAG
-    assert "declared offensive-security purpose" in " ".join(d.reasons)
+    assert "declares an offensive-security purpose" in " ".join(d.reasons)
+
+
+def test_a_clean_skill_is_not_labelled_offensive():
+    d = decide(Verdicts.offensive(NONE), FakeAnalysis())
+    assert d.action == ALLOW and not d.reasons
 
 
 def test_the_dual_use_path_never_reaches_allow():
     """Demoted and disclosed — never silently cleared."""
     for harm in ("minor", "serious", "severe"):
-        d = decide(Verdicts.offensive(HIGH), FakeAnalysis(harm=harm))
+        d = decide(Verdicts.offensive(HIGH),
+                   FakeAnalysis(harm=harm, mismatch=True))
         assert d.action in (FLAG, BLOCK)
 
 
@@ -178,7 +230,8 @@ def test_a_declared_purpose_does_not_excuse_a_mismatch():
 
 def test_an_undeclared_skill_gets_no_exemption():
     """The same evidence without the declaration still blocks."""
-    assert decide(Verdict(level=HIGH), FakeAnalysis(harm="severe")).action == BLOCK
+    assert decide(Verdict(level=HIGH),
+                  FakeAnalysis(harm="severe", mismatch=True)).action == BLOCK
 
 
 # ------------------------------------------------ the mismatch coherence guard

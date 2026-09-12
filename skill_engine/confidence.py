@@ -203,9 +203,48 @@ def decide(verdict, analysis=None) -> Decision:
     support("rule_critical_and_model_harm", verdict.level == CRITICAL and model_serious)
     support("rule_critical_and_mismatch", verdict.level == CRITICAL and mismatch)
     support("rule_critical_alone", verdict.level == CRITICAL)
+    # A model-asserted harm blocks only when the model also reports that the
+    # skill does something other than it claims — or when the rules found an
+    # unambiguous marker of their own.
+    #
+    # `harm_if_followed >= serious` measured 0 false positives on 149
+    # rule-clean skills, which earned it 0.95. Same base-rate error as
+    # `purpose_mismatch`: that measurement was taken on clean skills, and the
+    # population it judges is the gated 0.78%, where any mention of `.env` or a
+    # cookie invites the model to answer "severe".
+    #
+    # It blocked `overleap`, an Overleaf-to-local sync tool, on a
+    # `credential_egress` match against its own `OVERLEAF_COOKIE` config — with
+    # `mismatch: False` and extracted actions reading "check for prerequisites
+    # (Node.js >= 18, git)". A severity its own extraction does not support.
+    #
+    # The coherence requirement is also the semantically right one: for a skill
+    # whose declared purpose is innocuous, harm can only arise from doing
+    # something beyond that purpose, which is exactly what `purpose_mismatch`
+    # reports. A skill that is harmful *and* does what it claims is dual-use
+    # tooling, and the declared-purpose path handles that case deliberately.
+    #
+    # Measured over the first 272 modelled skills: 6 carried serious/severe
+    # harm, none with a mismatch. One was rule-critical (blocks regardless),
+    # four were declared dual-use (already demoted to `flag`), and the last was
+    # `overleap`. Zero labelled attacks are lost — `exfil-body`, the one that
+    # relies on this path, reports `mismatch: True`.
+    # Required only where the model was *primed*. `build_prompt` tells the
+    # model "an automated scan flagged these patterns", so on a gated skill it
+    # is being invited to agree with the scan — which is why the 0/149 figure,
+    # measured on skills the rules cleared, does not transfer to the gated
+    # population. On a rule-clean skill nothing primes it, so volunteering
+    # "severe" is unprompted and carries the information the measurement found.
+    #
+    # That asymmetry also preserves the audit sample's whole purpose: a
+    # rule-clean skill the model calls severely harmful is the signal that the
+    # gate has a hole, and it must still be able to act.
+    primed = verdict.level in (MEDIUM, HIGH)
+    model_blocking = model_serious and (mismatch or not primed)
+
     support("rule_high_and_model_harm",
-            model_serious and verdict.level in (HIGH, MEDIUM))
-    support("model_harm_severe_alone", model_serious)
+            model_blocking and verdict.level in (HIGH, MEDIUM))
+    support("model_harm_severe_alone", model_blocking)
     support("model_mismatch_alone", mismatch)
     support("rule_high_alone", verdict.level == HIGH)
     support("rule_medium_alone", verdict.level == MEDIUM)
@@ -246,12 +285,21 @@ def decide(verdict, analysis=None) -> Decision:
     # And the outcome is `flag`, not `allow`: the skill is demoted and the
     # reason is disclosed through the API, so a calling agent still learns what
     # it is asking for.
-    if (d.action == BLOCK and verdict.level != CRITICAL and not mismatch
-            and "declared_offensive_purpose" in (verdict.capabilities or [])):
+    declared = "declared_offensive_purpose" in (verdict.capabilities or [])
+    if d.action == BLOCK and verdict.level != CRITICAL and not mismatch and declared:
         d.action = FLAG
         d.basis = f"{basis}_declared_offensive"
         d.reasons.append("declared offensive-security purpose, consistent with "
                          "its body: demoted and disclosed rather than blocked")
+    elif declared and d.action != ALLOW:
+        # Recorded even when the demotion did not apply, because the fact is
+        # what a caller needs: this skill is flagged *and* openly describes
+        # itself as offensive tooling. Without this, tightening the blocking
+        # path silently took the useful half of the disclosure away — the
+        # skill stayed flagged and the reason became "rules: severe construct",
+        # which tells a reader nothing about what they are looking at.
+        d.reasons.append("declares an offensive-security purpose in its "
+                         "name or description")
     return d
 
 

@@ -49,6 +49,83 @@ GATED_LEVELS = (CRITICAL, HIGH, MEDIUM)
 
 
 
+def redecide(store: Store) -> int:
+    """Re-run the fusion layer over decisions already made.
+
+    The expensive half of this pipeline is the model, and its output is stored
+    verbatim in `risk_analysis`. So a change to `confidence.py` — a threshold, a
+    coherence requirement, a corrected precision figure — does not need any of
+    it re-run. Without this, every fusion fix meant discarding hours of model
+    work, which is a strong incentive to leave a fusion bug alone.
+
+    The rule verdict is recomputed from the current rules (cheap, and it must
+    match the code that produced the levels), but no model call is made.
+    """
+    rows = store.db.execute(
+        "SELECT id, name, repo, description, body, allowed_tools, path, "
+        "       risk_analysis FROM skills "
+        "WHERE risk_analysis IS NOT NULL").fetchall()
+    log.info("re-deciding %d stored analyses; no model calls", len(rows))
+
+    changed = counts = 0
+    moved: dict[tuple[str, str], int] = {}
+    for r in rows:
+        stored = json.loads(r["risk_analysis"] or "{}")
+        before = stored.get("action")
+        raw = stored.get("analysis") or {}
+
+        try:
+            tools = json.loads(r["allowed_tools"] or "[]")
+        except Exception:
+            tools = []
+        v = inspect(r["name"] or "", r["description"] or "",
+                    r["body"] or "", tools, r["path"] or "")
+
+        a = StoredAnalysis(raw) if raw.get("ok") else None
+        d = decide(v, a)
+        counts += 1
+        if d.action != before:
+            changed += 1
+            moved[(before or "?", d.action)] = moved.get((before or "?", d.action), 0) + 1
+            log.info("  %s -> %s  %s@%s — %s",
+                     before, d.action, r["name"], r["repo"], explain(d))
+        store.db.execute(
+            "UPDATE skills SET risk_level = ?, risk_confidence = ?, "
+            "risk_action = ?, risk_detail = ?, risk_analysis = ? WHERE id = ?",
+            (v.level, d.confidence, d.action,
+             v.as_json() if v.level != NONE else None,
+             json.dumps({**d.as_dict(), "analysis": raw or None}), r["id"]))
+    store.commit()
+
+    restored = overrides.apply_all(store)
+    print(f"\n  re-decided {counts}; {changed} changed")
+    for (before, after), n in sorted(moved.items()):
+        print(f"    {before} -> {after}: {n}")
+    if restored:
+        print(f"  re-applied {restored} human override(s)")
+    store.close()
+    return 0
+
+
+class StoredAnalysis:
+    """A stored model response, shaped like `Analysis` for `decide`.
+
+    Deliberately not the real dataclass: this reads back what was recorded,
+    and a field the recording never had must read as absent rather than as a
+    default that happens to look like evidence.
+    """
+
+    def __init__(self, raw: dict):
+        self.ok = bool(raw.get("ok"))
+        self.harm_if_followed = raw.get("harm_if_followed") or "none"
+        self.purpose_mismatch = bool(raw.get("purpose_mismatch"))
+        self.addresses_reviewer = bool(raw.get("addresses_reviewer"))
+        self.mismatch_explanation = raw.get("mismatch_explanation") or ""
+        self.framing = raw.get("framing") or "unclear"
+        self.claimed_purpose = raw.get("claimed_purpose") or ""
+        self.instructed_actions = raw.get("instructed_actions") or []
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("db")
@@ -58,6 +135,9 @@ def main() -> int:
                     help="also model N randomly chosen *unflagged* skills, to "
                          "estimate what the rule gate misses")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--redecide", action="store_true",
+                    help="re-run only the fusion layer, from the model output "
+                         "already stored; makes no model calls")
     ap.add_argument("--resume", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -70,6 +150,9 @@ def main() -> int:
 
     store = Store(path)
     overrides.ensure(store)
+
+    if args.redecide:
+        return redecide(store)
 
     use_model = not args.no_model
     if use_model and not available():
