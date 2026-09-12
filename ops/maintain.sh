@@ -36,9 +36,20 @@ echo $$ > "$LOCK"
 cleanup() {
   [ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null
   [ -n "${SPID:-}" ] && kill "$SPID" 2>/dev/null
-  rm -f "$LOCK"
+  # Only remove the lock if it is still ours. An unconditional `rm` meant a
+  # dying instance deleted the *live* instance's lockfile, after which a third
+  # invocation saw no lock and started a second loop — two writers on one
+  # SQLite file, which is the condition that produced a 33.7 GB log.
+  if [ "$(cat "$LOCK" 2>/dev/null)" = "$$" ]; then rm -f "$LOCK"; fi
 }
-trap cleanup EXIT INT TERM
+# A signal handler that does not exit is worse than none: bash runs the handler
+# and then *continues*. Trapping TERM to `cleanup` alone released the lockfile
+# and left the loop running without it, so the next invocation acquired the now
+# free lock — two supervisors on one SQLite file, which is how a 33.7 GB
+# write-ahead log happened. The signal handlers now only exit; EXIT does the
+# cleanup, exactly once.
+trap cleanup EXIT
+trap 'exit 143' INT TERM
 
 # An orphaned crawler (parent is init) is owned by nobody and will never be
 # stopped or bounded. Reap it rather than deferring to it forever.
