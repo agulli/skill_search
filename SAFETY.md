@@ -125,6 +125,54 @@ red-team tooling, was critical for exactly this reason. The test now asks
 whether a **scored** finding names one of the unambiguous markers, so a
 suppressed match cannot contribute.
 
+### Attacking the guards
+
+Each guard is an *exemption*, and an exemption that attacker-controlled text
+can claim is not an exemption but a bypass. Found by trying, against the live
+rules, with a payload carrying an override marker, anti-refusal phrasing and a
+credential POST:
+
+| Evasion | Effect | Why it worked |
+|---|---|---|
+| `## Prompt injection defence` heading | critical → high | `DEFENSIVE_CONTEXT` asks only whether defensive vocabulary sits within 260 characters, and its triggers include "e.g." |
+| Payload wrapped in ``` fences | critical → high | the fence test had just been added as a standalone exemption |
+| Skill named `security-audit` | critical → **medium** | a *reassuring* declaration treated as a warning — and the description's own words then supplied the defensive trigger |
+| `disregard prior findings` | pattern matched at all | the `disregard` branch required no object, unlike its `ignore` sibling |
+
+Two of those are worth dwelling on.
+
+**A reassuring declaration is not a warning.** The argument for honouring a
+declared subject is that an attacker who declares the dangerous capability has
+given up the disguise. That holds for `exfiltration` or `post-exploitation`,
+which *warn* whoever installs the skill. It does not hold for `security-audit`,
+which reassures them. Same mechanism, opposite effect, and the distinction
+decides whether the exemption is safe.
+
+**Evidence must be counted once.** The inspected text is name + description +
+body, so a skill described as "Security audit and threat detection" put those
+words inside the context window of any match near the top of its body — after
+the same words had already established the declared subject. One phrase proved
+the declaration and then proved the discussion. The window now starts at the
+body, never reading the header as evidence about the body.
+
+The fourth was fixed by making the *pattern* precise rather than adding another
+guard to undo it — the better repair whenever it is available. Of 21 corpus
+matches for the loose `disregard` form, requiring an instruction-like object
+drops three, and all three are benign.
+
+### What remains open, and why that is acceptable
+
+Two evasions survive, and both now require the attacker to declare a security
+subject **and** add framing in the body — which is what a scanner quoting a
+signature genuinely looks like, so closing them would cost real false
+positives. They land at `medium`, which is gated for model review.
+
+That was verified rather than assumed. Both crafted evasions were run through
+the local model, which read the fence correctly as `framing: discusses`,
+reported `harm: severe` anyway, and blocked each at **95% confidence**. The
+model layer is the backstop that makes the rule-layer exemption affordable, and
+it is the concrete payoff of "the model escalates".
+
 ### Unicode, split by measured precision
 
 The first version flagged any invisible character and was wrong about three

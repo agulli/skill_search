@@ -24,6 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from skill_engine import overrides
 from skill_engine.ranking import recompute
 from skill_engine.safety import assess_corpus
 from skill_engine.store import Store
@@ -83,6 +84,21 @@ def main() -> int:
     print(f"    " + ", ".join(f"{k} {v:,}" for k, v in sorted(counts.items())))
     if counts.get("critical"):
         print(f"    {counts['critical']:,} withheld from search")
+
+    # Re-assert human decisions last. `assess_corpus` only writes `risk_level`,
+    # so nothing here should have disturbed them — but this is the build that
+    # becomes the served artifact, and "should not have" is not a property
+    # worth relying on for the one step that decides what the public sees.
+    overrides.ensure(store)
+    restored = overrides.apply_all(store)
+    on_record = overrides.count(store)
+    if on_record:
+        print(f"    human overrides on record: "
+              + ", ".join(f"{k} {v}" for k, v in sorted(on_record.items()))
+              + (f" (re-applied to {restored} rows)" if restored else ""))
+    blocked = store.db.execute(
+        "SELECT COUNT(*) FROM skills WHERE risk_action = 'block'").fetchone()[0]
+    print(f"    {blocked:,} skills blocked from search")
     print(f"    Completed in {time.time()-t:.0f}s")
     t = log_step("Computing corpus-calibrated quality scores")
     result = recompute(store)
