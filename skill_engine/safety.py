@@ -98,11 +98,35 @@ def _rx(*patterns: str) -> re.Pattern:
 # Characters that carry text a reader cannot see. Unicode tag characters are
 # the notable one: they encode ASCII invisibly and exist in modern text for
 # essentially no legitimate purpose, which makes them a clean signal.
-HIDDEN_CHARS = re.compile(
-    r"[\U000E0000-\U000E007F]"          # Unicode tag block — invisible ASCII
-    r"|[‪-‮⁦-⁩]"    # bidi overrides — text that lies
-    r"|​{3,}|‌{3,}|‍{3,}"  # runs of zero-width joiners
-)
+# Invisible characters, separated by class because their precision differs
+# enormously. Measured across 95,725 real skills:
+#
+#   tag characters, 5+      2 skills   both genuine attacks
+#   bidi override (LRO/RLO) 2 skills   both genuine attacks
+#   bidi embed (LRE/RLE/PDF) 3 skills  all accidental — a stray U+202C pasted
+#                                      into a phone number
+#   bidi isolate (LRI..PDI)  1 skill   legitimate: a Flutter i18n skill that
+#                                      declares them with explanatory comments
+#   zero-width             118 skills  overwhelmingly benign
+#
+# Treating these alike gave the blocking rule a ~75% false-positive rate. Only
+# the first two classes earn a block.
+#
+# Tag characters encode ASCII invisibly and have essentially no legitimate use
+# in prose; a single one carries no information, so two or more is the signal
+# that text is being smuggled.
+HIDDEN_TAG = re.compile(r"[\U000E0000-\U000E007F]")
+HIDDEN_TAG_MIN = 2
+
+# LEFT-TO-RIGHT and RIGHT-TO-LEFT OVERRIDE: the Trojan Source pair. These force
+# visual reordering, which is the mechanism for making text read differently
+# from how it parses.
+HIDDEN_OVERRIDE = re.compile(r"[\u202d\u202e]")
+
+# Embeds, isolates and zero-width characters. Recorded, never blocking: the
+# isolates are what Unicode *recommends* for correct bidi handling, so a skill
+# teaching internationalisation contains them by necessity.
+HIDDEN_BENIGN = re.compile(r"[\u202a-\u202c\u2066-\u2069]|\u200b{3,}|\u200c{3,}|\u200d{3,}")
 
 OVERRIDE = _rx(
     r"ignore\s+(?:all\s+)?(?:your\s+|the\s+)?(?:previous|prior|above|earlier|system)\s+"
@@ -293,7 +317,12 @@ DEFENSIVE_CONTEXT = _rx(
     r"ignore\s+(?:such|these|those)\b|should\s+be\s+(?:ignored|rejected|flagged)",
     r"security\s+(?:review|check|audit)|threat|mitigat|defen[cs]e|guard\s+against",
     # The central idea these skills express, in the words they use for it.
-    r"(?:is|are|as)\s+data,?\s+not\s+(?:instructions|commands)",
+    # "data, never instructions" and "not executable instructions" both appear
+    # in real defensive skills and both missed a pattern requiring "not".
+    r"(?:is|are|as)\s+data,?\s+(?:not|never)\s+(?:executable\s+)?"
+    r"(?:instructions|commands)",
+    r"\bis\s+itself\s+a\s+finding\b|\brecord\s+it\b|\bnote\s+it\s+and\b",
+    r"\bA/?B\s+test|\bboth\s+arms\b|\bcontrol\s+arm\b|\bunaided\s+reproduction\b",
     r"\buntrusted\b|\bnot\s+instructions\b|never\s+(?:interpret|execute|follow)",
     r"\b(?:scan|look|watch|check)\s+for\b|\bflag\s+(?:it|them|this)\b",
     r"\brole[- ]spoof|countermand|impersonat",
@@ -305,24 +334,100 @@ DEFENSIVE_CONTEXT = _rx(
 CONTEXT_WINDOW = 260
 
 
-def _is_discussed(text: str, match: re.Match) -> bool:
-    """True when a match reads as description rather than instruction.
+# A phrase preceded by a prohibition is the opposite of an instruction.
+# `goal-mode` was blocked for "it must not override safety rules, exfiltrate
+# secrets, or run as shell" — a rule forbidding exactly what the detector
+# thought it was demanding. This is the most general of the four false-positive
+# classes found in the corpus, because a safety-conscious skill naturally
+# enumerates what it will not do.
+NEGATED = _rx(
+    r"(?:must|should|shall|will|does|do|did|can|could|may)\s*n[o']?t\s+\w{0,14}\s*$",
+    r"\bnever\s+\w{0,14}\s*$",
+    r"\b(?:don'?t|doesn'?t|won'?t|cannot|can'?t|shouldn'?t|mustn'?t)\s+\w{0,14}\s*$",
+    r"\b(?:refuse[sd]?\s+to|prohibited\s+from|forbidden\s+to|rather\s+than)\s*$",
+    r"\b(?:without|avoid|prevent|block|reject)\s+\w{0,14}\s*$",
+)
 
-    Two signals: defensive vocabulary nearby, or the phrase sitting inside
-    backticks or quotation marks, which is how a document quotes a string
-    rather than issuing it.
+# How far back to look for that negation. Long enough to span "it must not",
+# short enough that a negation in a previous sentence does not excuse a real
+# instruction.
+NEGATION_WINDOW = 46
+
+# A quoted example can sit well outside the match: "Forget everything you know
+# about investing" is 42 characters, and the closing quote comes after all of
+# it. `alterlab-pra-copywriter`, a copywriting skill, was blocked for listing
+# that as a Provocation technique.
+QUOTE_WINDOW = 90
+
+
+# Vocabulary that frames a dangerous string as something to *find* rather than
+# something to *run*. A scanner necessarily contains the signatures it scans
+# for — `local-security-check` was blocked for holding `rm -rf /` and
+# `~/.ssh/` in a list of patterns, which is exactly what this module's own
+# source does. A detector that flags detectors is not a detector.
+DETECTOR_FRAMING = _rx(
+    r"\b(?:detect|detects|detecting|scan(?:s|ning)?\s+for|look(?:s|ing)?\s+for|"
+    r"search(?:es|ing)?\s+for|check(?:s|ing)?\s+for|flag(?:s|ged|ging)?|"
+    r"identif(?:y|ies|ying)|match(?:es|ing)?)\b",
+    r"\b(?:pattern|signature|indicator|heuristic|rule|regex|red\s+flag|"
+    r"warning\s+sign|smell|antipattern|anti-pattern|finding|violation)s?\b",
+    r"\b(?:audit|review|lint(?:er|ing)?|inspect(?:ion|or)?|forensic)s?\b",
+    r"\b(?:if\s+(?:you\s+)?(?:find|see|encounter)|report\s+(?:it|this|any))\b",
+)
+
+DETECTOR_WINDOW = 200
+
+
+def _is_detector_framing(text: str, match: re.Match, security_subject: bool) -> bool:
+    """True when a severe construct is listed as a signature, not an action.
+
+    Requires *both* that the skill's declared subject is security work and that
+    the surrounding text frames the match as something to find. Either alone is
+    too weak: an attacker can write the word "detect" next to a payload, and a
+    security skill can still legitimately instruct something destructive.
     """
+    if not security_subject:
+        return False
+    lo = max(0, match.start() - DETECTOR_WINDOW)
+    window = text[lo:match.end() + DETECTOR_WINDOW]
+    return bool(DETECTOR_FRAMING.search(window))
+
+
+def _is_negated(text: str, match: re.Match) -> bool:
+    """True when the matched phrase is forbidden rather than instructed."""
+    lo = max(0, match.start() - NEGATION_WINDOW)
+    return bool(NEGATED.search(text[lo:match.start()]))
+
+
+def _is_quoted(text: str, match: re.Match) -> bool:
+    """True when the phrase sits inside quotes or backticks.
+
+    Requires the opening mark before and a closing mark after, and rejects the
+    case where a sentence ends between the match and the closing mark — which
+    is how an unquoted instruction followed by unrelated quoted text would
+    otherwise pass.
+    """
+    opens = "`\"'\u201c\u2018\u300c"
+    closes = "`\"'\u201d\u2019\u300d"
+    before = text[max(0, match.start() - QUOTE_WINDOW):match.start()]
+    after = text[match.end():match.end() + QUOTE_WINDOW]
+    if not any(c in before for c in opens):
+        return False
+    cut = re.split(r"[.!?]\s", after, maxsplit=1)[0]
+    return any(c in cut for c in closes)
+
+
+def _is_discussed(text: str, match: re.Match) -> bool:
+    """True when a match reads as description rather than instruction."""
+    if _is_negated(text, match):
+        return True
     lo = max(0, match.start() - CONTEXT_WINDOW)
     window = text[lo:match.end() + CONTEXT_WINDOW]
     if DEFENSIVE_CONTEXT.search(window):
         return True
-    # A wider window than the match edges: OVERRIDE matches "ignore previous
-    # instruction" (singular), so a quoted "ignore previous instructions…"
-    # leaves several characters before the closing quote.
-    before = text[max(0, match.start() - 12):match.start()]
-    after = text[match.end():match.end() + 14]
-    return bool(re.search(r"[`\"'\u201c\u2018\u300c\uff02]", before) and
-                re.search(r"[`\"'\u201d\u2019\u300d\uff02]", after))
+    if _is_quoted(text, match):
+        return True
+    return False
 
 
 def _evidence(match: re.Match | None) -> str:
@@ -337,11 +442,31 @@ def inspect(name: str, description: str, body: str,
 
     # --- unambiguous markers. Not discounted, not combined: their presence is
     # the finding, and `critical` here removes the skill from search.
-    hidden = HIDDEN_CHARS.search(text)
-    if hidden:
-        v.findings.append(Finding("hidden_unicode", 10.0,
-                                  f"U+{ord(hidden.group(0)[0]):04X} invisible character"))
+    tags = HIDDEN_TAG.findall(text)
+    override = HIDDEN_OVERRIDE.search(text)
+    hidden = None
+    if len(tags) >= HIDDEN_TAG_MIN:
+        hidden = True
+        v.findings.append(Finding(
+            "hidden_unicode_payload", 10.0,
+            f"{len(tags)} Unicode tag characters encoding hidden text "
+            f"(first U+{ord(tags[0]):04X})"))
         v.score += 10.0
+    elif override:
+        hidden = True
+        v.findings.append(Finding(
+            "bidi_override", 10.0,
+            f"U+{ord(override.group(0)):04X} forces visual reordering"))
+        v.score += 10.0
+    else:
+        benign = HIDDEN_BENIGN.search(text)
+        if benign:
+            # Recorded for auditing, scored at zero: these were the false
+            # positives, and a blocked skill nobody can explain is worse than
+            # an unblocked one.
+            v.findings.append(Finding(
+                "invisible_chars_present", 0.0,
+                f"U+{ord(benign.group(0)[0]):04X} (bidi/zero-width, not blocking)"))
     override = OVERRIDE.search(text)
     if override and not _is_discussed(text, override):
         v.findings.append(Finding("instruction_override", 10.0, _evidence(override)))
@@ -363,16 +488,28 @@ def inspect(name: str, description: str, body: str,
         v.findings.append(Finding("concealment", 3.0, _evidence(conceal)))
         v.score += 3.0
 
+    security_subject = bool(SECURITY_CONTEXT.search(f"{name} {description} {path}"))
+
     # --- severe constructs, judged on their own
     for label, rx, weight in SEVERE:
         m = rx.search(text)
-        if m:
-            v.findings.append(Finding(label, weight, _evidence(m)))
-            v.capabilities.append(label)
-            v.score += weight
+        if not m:
+            continue
+        if _is_detector_framing(text, m, security_subject):
+            # Discounted heavily rather than exempted: a security skill with
+            # several severe constructs still accumulates enough to surface,
+            # so this cannot be used as a blanket bypass by declaring a
+            # security subject.
+            w = weight * 0.15
+            v.findings.append(Finding(f"{label}_as_signature", round(w, 2),
+                                      _evidence(m)))
+            v.score += w
+            continue
+        v.findings.append(Finding(label, weight, _evidence(m)))
+        v.capabilities.append(label)
+        v.score += weight
 
     # --- capabilities
-    security_subject = bool(SECURITY_CONTEXT.search(f"{name} {description} {path}"))
     for label, rx, weight in CAPABILITY_RULES:
         m = rx.search(text)
         if not m:
@@ -487,9 +624,13 @@ def _gate_patterns() -> list[str] | None:
     Returning None rather than a partial set is deliberate: a gate missing one
     rule silently stops detecting whatever that rule caught.
     """
-    groups = [HIDDEN_CHARS, OVERRIDE, CONCEALMENT, INLINE_SECRET,
-              SENSITIVE_READ, NETWORK_EGRESS, SUSPICIOUS_HOST, DESTRUCTIVE,
-              PERSISTENCE, OBFUSCATION]
+    # HIDDEN_BENIGN is included even though it never blocks: the gate decides
+    # what gets *inspected*, and a document whose only marker is a benign
+    # invisible character must still reach `inspect` so the finding is recorded
+    # for auditing. Over-inclusive is the safe direction here.
+    groups = [HIDDEN_TAG, HIDDEN_OVERRIDE, HIDDEN_BENIGN, OVERRIDE,
+              CONCEALMENT, INLINE_SECRET, SENSITIVE_READ, NETWORK_EGRESS,
+              SUSPICIOUS_HOST, DESTRUCTIVE, PERSISTENCE, OBFUSCATION]
     raw = [g.pattern for g in groups] + [rx.pattern for _, rx, _ in SEVERE]
     return [_strip_lookaround(p) if LOOKAROUND_OPEN.search(p) else p
             for p in raw]
