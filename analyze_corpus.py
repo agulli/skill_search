@@ -77,7 +77,7 @@ def main() -> int:
         use_model = False
 
     sql = ("SELECT id, name, repo, description, body, allowed_tools, path, "
-           "       risk_confidence FROM skills WHERE valid = 1")
+           "       content_hash, risk_confidence FROM skills WHERE valid = 1")
     if args.limit:
         sql += f" LIMIT {args.limit}"
 
@@ -125,8 +125,23 @@ def main() -> int:
         log.info("audit sample: %d of %d unflagged skills will also be modelled",
                  len(audit), clean_seen)
 
-    # ---- stage 2 + 3
+    # ---- one analysis per distinct content
+    #
+    # The corpus is heavily vendored: 85 of 726 gated rows are byte-identical
+    # copies of another. Analysing each copy separately is not just 12% wasted
+    # model time, it allows two copies of one skill to end up with *different*
+    # decisions. A decision belongs to the content — which is already how the
+    # override table is keyed — so one representative is modelled and the
+    # result is written to every row sharing its hash.
     todo = gated + audit
+    by_content: dict[str, list] = {}
+    for r in todo:
+        by_content.setdefault(r["content_hash"] or f"id:{r['id']}", []).append(r)
+    if len(by_content) != len(todo):
+        log.info("%d rows collapse to %d distinct contents",
+                 len(todo), len(by_content))
+    todo = [rows[0] for rows in by_content.values()]
+
     if args.resume:
         before = len(todo)
         todo = [r for r in todo if r["risk_confidence"] is None]
@@ -159,14 +174,20 @@ def main() -> int:
             log.warning("AUDIT SAMPLE HIT — the rule gate missed this: %s@%s — %s",
                         r["name"], r["repo"], explain(d))
 
-        store.db.execute(
-            "UPDATE skills SET risk_level = ?, risk_confidence = ?, "
-            "risk_action = ?, risk_detail = ?, risk_analysis = ? WHERE id = ?",
-            (v.level, d.confidence, d.action,
-             v.as_json() if v.level != NONE else None,
-             json.dumps({**d.as_dict(),
-                         "analysis": a.as_dict() if a else None}),
-             r["id"]))
+        payload = (v.level, d.confidence, d.action,
+                   v.as_json() if v.level != NONE else None,
+                   json.dumps({**d.as_dict(),
+                               "analysis": a.as_dict() if a else None}))
+        if r["content_hash"]:
+            store.db.execute(
+                "UPDATE skills SET risk_level = ?, risk_confidence = ?, "
+                "risk_action = ?, risk_detail = ?, risk_analysis = ? "
+                "WHERE content_hash = ?", (*payload, r["content_hash"]))
+        else:
+            store.db.execute(
+                "UPDATE skills SET risk_level = ?, risk_confidence = ?, "
+                "risk_action = ?, risk_detail = ?, risk_analysis = ? "
+                "WHERE id = ?", (*payload, r["id"]))
         # Committed per row: an interrupted two-hour job must not start over.
         store.commit()
         if i % 25 == 0 or i == len(todo):
