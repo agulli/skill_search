@@ -331,6 +331,19 @@ select,input[type=number]{width:100%;padding:6px 8px;border:1px solid var(--line
   border-radius:999px;padding:1px 8px;white-space:nowrap}
 .tag.q{color:var(--accent);border-color:var(--ring)}
 .tag.a{color:var(--muted);border-style:dashed}
+/* A flagged skill is demoted in ranking, and that is invisible to whoever
+   reads the list. This says so. Blocked skills are never returned at all, so
+   this only ever marks a skill the reader may still choose to use. */
+.tag.risk{color:#8a5a00;border-color:#d9a640;background:#fff8e8}
+.riskbox{border:1px solid #d9a640;background:#fff8e8;border-radius:8px;
+  padding:10px 12px;margin:12px 0}
+.riskbox h4{margin:0 0 6px;font-size:13px;color:#8a5a00}
+.riskbox ul{margin:0;padding-left:18px;font-size:12.5px;color:#6b4a10}
+.riskbox .sub{margin:6px 0 0;font-size:11.5px}
+@media (prefers-color-scheme:dark){
+.tag.risk{color:#ffc766;border-color:#7a5a1e;background:#2a2113}
+.riskbox{border-color:#7a5a1e;background:#2a2113}
+.riskbox h4{color:#ffc766} .riskbox ul{color:#e0bb7a}}
 .authorbox{border:1px solid var(--line);border-radius:9px;padding:12px 14px;margin:0 0 16px;
   background:var(--bg)}
 .authorbox h4{margin:0 0 8px;font-size:13px;display:flex;justify-content:space-between;
@@ -502,12 +515,22 @@ async function renderCategory(mine){
      ${d.results.length>=state.limit?'<button class="more" id="more">Show more</button>':""}`;
 }
 
+// Only the levels a reader can act on. `low` is noise at this level of
+// detail — 1.4% of the corpus, and the rules themselves treat it as
+// informational — so badging it would train people to ignore the badge.
+function riskTag(r){
+  const L={high:"review before use",medium:"review before use",
+           critical:"withheld"}[r.risk];
+  return L?`<span class="tag risk" title="Flagged by the safety gate; open the skill for the reasons">⚠ ${L}</span>`:"";
+}
+
 function hitCard(r){
   const tags=[`<span class="tag q">q${Math.round(r.quality)}</span>`,
     r.author_score!=null?`<span class="tag a">author ${Math.round(r.author_score)}</span>`:"",
     `<span class="tag">${num(r.stars)}★</span>`,
     r.license?`<span class="tag">${esc(r.license)}</span>`:"",
-    r.duplicates?`<span class="tag">${r.duplicates} copies</span>`:""].join("");
+    r.duplicates?`<span class="tag">${r.duplicates} copies</span>`:"",
+    riskTag(r)].join("");
   return `<article class="hit" data-id="${r.id}">
     <p class="title">${esc(r.name)}</p>
     <p class="repo">${esc(r.repo)} · ${esc(r.path)}</p>
@@ -552,7 +575,8 @@ function render(d){
           r.kind?`<span class="tag">${esc(r.kind)}</span>`:"",
           r.license?`<span class="tag">${esc(r.license)}</span>`:"",
           r.duplicates?`<span class="tag">${r.duplicates} copies</span>`:"",
-          r.resources.length?`<span class="tag">${r.resources.length} files</span>`:""
+          r.resources.length?`<span class="tag">${r.resources.length} files</span>`:"",
+          riskTag(r)
         ].join("");
         return `<article class="hit" data-id="${r.id}">
           <p class="title">${esc(r.name)}</p>
@@ -617,9 +641,24 @@ async function openSkill(id){
       ${s.resources?.length?`<dt>Bundled</dt><dd>${esc(s.resources.join(", "))}</dd>`:""}
       <dt>Source</dt><dd><a href="${esc(s.url)}" target="_blank" rel="noopener">view on GitHub ↗</a></dd>
     </dl>
+    ${riskPanel(s.risk)}
     ${a?authorPanel(a):""}
     ${bars?`<div class="bars">${bars}</div>`:""}
     <pre>${esc(s.body||"(no body)")}</pre>`;
+}
+
+// The reasons, above the body, because the point is to be read *before* the
+// instructions are. Shown for a flagged skill only: saying "allowed" on 97.8%
+// of the corpus would be noise, and a badge that appears everywhere carries
+// nothing.
+function riskPanel(k){
+  if(!k || k.action==="allow" || !(k.reasons||[]).length) return "";
+  const conf=k.confidence==null?"":` · ${Math.round(k.confidence*100)}% confidence`;
+  return `<div class="riskbox">
+    <h4>⚠ Flagged by the safety gate${esc(conf)}</h4>
+    <ul>${k.reasons.map(r=>`<li>${esc(r)}</li>`).join("")}</ul>
+    <p class="sub">Ranked lower as a precaution. Read the instructions below
+      before letting an agent follow them.</p></div>`;
 }
 function authorPanel(a){
   const f=(a.breakdown&&a.breakdown.facts)||{};

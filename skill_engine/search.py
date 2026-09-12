@@ -100,6 +100,10 @@ class Hit:
                              else round(self.author_score, 1)),
             "snippet": self.snippet,
             "resources": self.resources,
+            # Compact by design: a badge in a result list, with the reasons
+            # available from the detail endpoint. `none` for the overwhelming
+            # majority, so it costs nothing on the wire.
+            "risk": self.risk,
         }
 
 
@@ -578,7 +582,51 @@ def get_skill(store: Store, skill_id: int) -> dict | None:
     data["raw_url"] = (
         f"https://raw.githubusercontent.com/{data['repo']}/{branch}/{data['path']}"
     )
+    data["risk"] = _risk_disclosure(data)
     return data
+
+
+def _risk_disclosure(data: dict) -> dict:
+    """What a caller is told about a skill's safety assessment.
+
+    `flag` is defined as *demote and disclose*, and the disclosure half was
+    missing: the raw `risk_analysis` and `risk_detail` blobs were shipped
+    verbatim — internal, unshaped and useless to a client — while nothing said
+    plainly that the skill had been flagged or why.
+
+    Blocked skills never reach here, since search excludes them. So this
+    describes a skill the caller *may* use, which is exactly when the reasons
+    matter: an agent about to follow these instructions deserves to know the
+    gate had doubts, and what they were.
+    """
+    level = data.pop("risk_level", None) or "none"
+    action = data.pop("risk_action", None)
+    confidence = data.pop("risk_confidence", None)
+    analysis = data.pop("risk_analysis", None)
+    detail = data.pop("risk_detail", None)
+
+    reasons: list[str] = []
+    try:
+        reasons = (json.loads(analysis) or {}).get("reasons") or []
+    except (json.JSONDecodeError, TypeError):
+        pass
+    if not reasons and detail:
+        # Rules-only index: name the rules that matched instead.
+        try:
+            reasons = [f.get("rule", "") for f
+                       in (json.loads(detail) or {}).get("findings", [])
+                       if f.get("weight")]
+        except (json.JSONDecodeError, TypeError):
+            reasons = []
+
+    return {
+        # `unassessed` and `allow` are different facts, and a caller deciding
+        # whether to trust a skill needs to tell them apart.
+        "action": action or ("allow" if level == "none" else "unassessed"),
+        "level": level,
+        "confidence": (None if confidence is None else round(confidence, 2)),
+        "reasons": [r for r in reasons if r][:8],
+    }
 
 
 # ------------------------------------------------------------------ browsing

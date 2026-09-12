@@ -124,3 +124,82 @@ def test_an_unassessed_index_still_works(tmp_path):
     st.commit()
     assert "key-rotation" in names(search(st, "rotate signing keys"))
     st.close()
+
+
+# --------------------------------------------- `flag` has to actually disclose
+
+
+def test_a_flagged_skill_discloses_its_reasons(store):
+    """`flag` means demote *and disclose*, and the second half was missing.
+
+    The detail endpoint shipped the raw `risk_analysis` and `risk_detail` blobs
+    — internal, unshaped, useless to a client — while nothing said plainly
+    that the gate had doubts. An agent about to follow a skill's instructions
+    is exactly who needs to know.
+    """
+    import json as _json
+
+    from skill_engine import overrides
+    from skill_engine.search import get_skill
+
+    overrides.ensure(store)
+    sid = store.db.execute("SELECT id FROM skills WHERE name = 'key-recon'"
+                           ).fetchone()["id"]
+    store.db.execute(
+        "UPDATE skills SET risk_analysis = ? WHERE id = ?",
+        (_json.dumps({"action": "flag", "confidence": 0.55,
+                      "reasons": ["rules: severe construct (remote_code_execution)",
+                                  "declared offensive-security purpose"]}), sid))
+    store.commit()
+
+    data = get_skill(store, sid)
+    assert data["risk"]["action"] == "flag"
+    assert data["risk"]["confidence"] == 0.55
+    assert any("offensive" in r for r in data["risk"]["reasons"])
+    # and the internal blobs must not be shipped
+    assert "risk_analysis" not in data and "risk_detail" not in data
+
+
+def test_an_unassessed_skill_is_not_reported_as_allowed(store):
+    """"never assessed" and "assessed clean" are different facts."""
+    from skill_engine.search import get_skill
+
+    sid = store.db.execute("SELECT id FROM skills WHERE name = 'key-rotation'"
+                           ).fetchone()["id"]
+    store.db.execute("UPDATE skills SET risk_level = NULL, risk_action = NULL "
+                     "WHERE id = ?", (sid,))
+    store.commit()
+    assert get_skill(store, sid)["risk"]["action"] == "allow"
+
+    store.db.execute("UPDATE skills SET risk_level = 'medium' WHERE id = ?", (sid,))
+    store.commit()
+    assert get_skill(store, sid)["risk"]["action"] == "unassessed"
+
+
+def test_a_rules_only_index_names_the_rules_that_matched(store):
+    """No fused decision, so the findings are the only reasons available."""
+    import json as _json
+
+    from skill_engine import overrides
+    from skill_engine.search import get_skill
+
+    overrides.ensure(store)
+    sid = store.db.execute("SELECT id FROM skills WHERE name = 'key-recon'"
+                           ).fetchone()["id"]
+    store.db.execute(
+        "UPDATE skills SET risk_analysis = NULL, risk_detail = ? WHERE id = ?",
+        (_json.dumps({"level": "high", "findings": [
+            {"rule": "credential_egress", "weight": 8.0},
+            {"rule": "override_discussed", "weight": 0.0}]}), sid))
+    store.commit()
+
+    reasons = get_skill(store, sid)["risk"]["reasons"]
+    assert "credential_egress" in reasons
+    # a finding a guard zeroed is not a reason for anything
+    assert "override_discussed" not in reasons
+
+
+def test_search_results_carry_a_risk_badge(store):
+    hits = {h.name: h for h in search(store, "rotate signing keys")}
+    assert hits["key-recon"].to_dict()["risk"] == "high"
+    assert hits["key-rotation"].to_dict()["risk"] == "none"
