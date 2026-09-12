@@ -42,6 +42,10 @@ The pipeline operates across decoupled stages, with state checkpointed in an ACI
 | `authors.py` | Author track record, originality ratio, portfolio aggregation |
 | `taxonomy.py` | IDF-weighted categorization into 16 domain clusters |
 | `search.py` | Hybrid BM25/vector retrieval, RRF fusion, diversity demotion, dynamic facets |
+| `safety.py` | Deterministic rule layer: unambiguous markers, severe constructs, capability combinations, context guards |
+| `analyze.py` | Local-model extraction of what a skill instructs, schema-constrained, injection-resistant |
+| `confidence.py` | Evidence fusion and the blocking decision, weighted by measured per-signal precision |
+| `overrides.py` | Content-addressed human decisions that outrank and survive the pipeline |
 | `serve.py` | Embedded stdlib HTTP server, JSON REST API, and responsive web interface |
 | `mcp_server.py` | Read-only Model Context Protocol (MCP) server |
 | `gemini_agent.py` | Reference agent integration using Google GenAI SDK (`gemini-2.5-flash`) |
@@ -438,6 +442,114 @@ equivalents.
 | 95th Percentile Latency (p95) | 118 ms |
 | Total Indexed Skills | 3,360,000+ |
 | Curated Production Cut | 100,006 skills |
-| Unit & Integration Test Suite | 174 passing tests |
+| Unit & Integration Test Suite | 262 passing tests |
 
 All algorithms, models, and retrieval mechanics are validated in the accompanying test suite under `tests/`.
+
+---
+
+## 14. Harm Prevention & the Blocking Gate
+
+An index of agent skills is a supply chain. A skill is not data an agent reads;
+it is **instructions an agent follows**, retrieved automatically, often with
+tool access already granted. Ranking a malicious skill first is not a relevance
+failure — it is remote code execution with extra steps. Full treatment in
+[SAFETY.md](SAFETY.md); this section records the architecture and the results.
+
+### 14.1 Three Layers, Chosen by Cost
+
+| Layer | Question | Throughput |
+|---|---|---|
+| Rules (`safety.py`) | Where is there anything worth reading? | 239 skills/sec |
+| Model (`analyze.py`) | What does this document actually instruct? | ~24 s/skill |
+| Fusion (`confidence.py`) | What does the combined evidence support? | free |
+
+The rules run over everything and gate 0.78% of the corpus. The model only ever
+sees that 0.78%, which is what makes local inference affordable: 722 distinct
+analyses instead of 95,725. A Rust `RegexSet` pre-gate ahead of the rules
+selects 8,166 of 95,725 rows at 1.19M docs/sec; it is permitted to be
+over-inclusive and never the reverse, a property re-verified across the whole
+corpus after every rule change.
+
+The model is local (`gemma4` via Ollama) so the corpus is never sent to a third
+party, and the architecture assumes it is weak: it is asked only to *describe*,
+it can only escalate a verdict, and its one high-false-positive output is
+weighted below the action threshold.
+
+### 14.2 The Governing Rule
+
+**The model escalates; it never exonerates.** Letting it overturn a rule hit
+would fix one false positive and unblock six genuine attacks, because the model
+reported `harm: none` for six labelled attacks. A detector with 50% recall
+cannot serve as an acquittal.
+
+Confidence is the *measured share of skills at that confidence that were
+genuine attacks* — a table of observations in `confidence.py`, not weights
+chosen to look reasonable. Everything is capped below 1.0: 33 labelled cases
+cannot justify certainty, and a confidence of 1.0 invites treating a block as
+unappealable.
+
+### 14.3 Precision Measured at the True Base Rate
+
+Precision on an attack-enriched sample is not precision. Measured against 149
+randomly sampled rule-clean skills:
+
+| Signal | False positives | Rate |
+|---|---|---|
+| `purpose_mismatch` | 0/149 | 0.0% |
+| `harm_if_followed >= minor` | 0/149 | 0.0% |
+| `addresses_reviewer` | **45/149** | **30.2%** |
+
+`addresses_reviewer` measured 58% precision on the enriched set and was
+weighted accordingly. Its true false-positive rate moved it to 0.10 —
+deliberately below the flag threshold, so it cannot act alone.
+
+### 14.4 Results
+
+| Level | Skills | Share |
+|---|---|---|
+| critical (withheld from search) | 20 | 0.021% |
+| high | 117 | 0.122% |
+| medium | 610 | 0.637% |
+| low | 1,364 | 1.425% |
+| none | 93,614 | 97.795% |
+
+On the hand-labelled set: **18/18 attacks caught, 0/15 legitimate skills
+blocked.** All 20 blocked skills were read individually; every one is a genuine
+attack or a deliberate attack fixture shipped inside a skill-vetting tool.
+
+### 14.5 Review and Override
+
+Blocking on suspicion is defensible only if blocks can be inspected and
+reversed. `review_blocks.py show` prints the entire evidence chain — the rules
+that matched with their surrounding text, what the model extracted, the
+resulting confidence and basis, and the body itself.
+
+Overrides are keyed on the **content hash**, not the path: the decision was
+about text, so it covers every vendored copy at once and stops applying if the
+file is replaced. They are re-asserted at the end of every pass that writes
+`risk_action`, including the release build, because a review whose result the
+next run discards is not a review.
+
+### 14.6 What the Corpus Taught
+
+Four findings that generalise beyond this system:
+
+1. **A detector will flag detectors.** A security scanner and an attack contain
+   the same bytes. Four context guards exist solely to separate them, and the
+   gate once blocked a scanner for holding `rm -rf /` in a pattern list —
+   exactly what `safety.py` itself does.
+2. **A reassuring declaration is not a warning.** Honouring a declared purpose
+   is safe when the declaration *warns* the user (`exfiltration`,
+   `post-exploitation`) and unsafe when it *reassures* them (`security-audit`,
+   `bootstrap`). Same mechanism, opposite effect.
+3. **Heuristics fail on the corpus, not in theory.** A pipe-counting table
+   test read `cat ~/.ssh/id_rsa | base64 | curl` as a three-cell table row and
+   discounted a private-key exfiltration to 15% of its weight. Operational
+   vocabulary in the security list discounted 1,828 skills by 55–85% for saying
+   "Kafka partitions". Multi-word terms used literal spaces and so could never
+   match the kebab-case names that dominate the corpus.
+4. **Punishing good behaviour is the worst failure mode.** Seven skills were
+   blocked for *warning* about prompt injection, none of which was a security
+   skill — a peer-review assistant, a dependency upgrader, an eval harness.
+   Any skill handling untrusted input should carry that text.
