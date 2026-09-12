@@ -370,6 +370,52 @@ both labelled attacks that triggered mismatch reported `harm: severe`. And
 local model never populates it — so a guard built on that field would never
 have fired. Measured, then discarded.
 
+### A primed model agreeing with the scan is not corroboration
+
+This is the subtlest thing the corpus taught, and it changes how the model's
+output should be read.
+
+`build_prompt` tells the model *"An automated scan flagged these patterns"*.
+That is deliberate — it directs attention to where the suspicious text is — but
+it means that on a gated skill the model is being **invited to agree**. On a
+rule-clean skill nothing primes it, so the same answer is volunteered rather
+than prompted, and carries far more information.
+
+The measurement that gave `harm_if_followed >= serious` its 0.95 weight was
+taken on 149 skills the rules had *cleared* — the unprimed population. Applied
+to the gated population it blocked:
+
+| Skill | Its own description | What the rule matched |
+|---|---|---|
+| `overleap` | Overleaf-to-local project sync | its own `OVERLEAF_COOKIE` in `.env` |
+| `block-storage` | "Manage block storage volumes and LVM" | `root_deletion`, `destructive` |
+| `linux-administration` | "System administration for Linux servers" | `root_deletion`, `destructive`, `persistence` |
+
+All three reported `mismatch: False`, and `overleap`'s extracted actions read
+"check for prerequisites (Node.js >= 18, git)" — a severity its own extraction
+does not support.
+
+So corroboration is required exactly where the priming happens. A
+model-asserted harm at `medium` or `high` needs a reported mismatch as well; at
+`none` or `low` it still acts alone. That second half matters as much as the
+first: a rule-clean skill the model calls harmful is the *only* signal that the
+gate has a hole, so the audit sample must retain the power to act on it.
+
+Measured over the first 272 modelled skills, six carried serious or severe
+harm and none reported a mismatch: one was rule-critical (blocked on the rules
+anyway), four were declared dual-use (already demoted), and the last was
+`overleap`. No labelled attack is lost — `exfil-body`, the one that depends on
+this path, reports a mismatch.
+
+### Fusion changes must be cheap, or they do not get made
+
+The model is the expensive half and its output is stored verbatim, so
+`analyze_corpus.py --redecide` re-runs only the fusion layer: 258 stored
+analyses in 6 seconds, no model calls. Before it existed, correcting a
+threshold meant discarding five hours of model work — which is a strong
+incentive to leave a fusion bug alone, and that incentive is itself a safety
+problem.
+
 ### Honest dual-use tooling is demoted, not removed
 
 The first corpus run also blocked `hunt-rce` ("built from 67 public bug bounty
