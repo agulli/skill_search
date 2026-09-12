@@ -1,20 +1,23 @@
 """Combining the rule findings and the model's description into a decision.
 
-Two detectors with very different characteristics, measured on a hand-labelled
-set drawn from the live corpus:
+Two detectors with very different characteristics, measured twice — once on a
+hand-labelled corpus sample, and again for false positives on 149 randomly
+chosen skills the rules had cleared:
 
-    deterministic rules    100% recall, 86% precision
-    model, harm >= minor   100% precision,  50% recall
-    model, purpose_mismatch 100% precision, 17% recall
-    model, addresses_reviewer 58% precision, 58% recall
+    deterministic rules       100% recall, 92% precision
+    model, harm >= minor       50% recall,  0/149 false positives
+    model, purpose_mismatch    17% recall,  0/149 false positives
+    model, addresses_reviewer  58% recall, 45/149 false positives (30.2%)
 
 That asymmetry dictates the whole design, and it is the opposite of what a
-naive average would do.
+naive average would do. Two signals that never fire on a clean skill can carry
+a block; one that fires on a third of them cannot, however plausible its
+reasoning reads.
 
 ### The model escalates; it never exonerates
 
-The temptation is to let the model overturn a rule hit — it would fix the two
-remaining false positives, both threat-taxonomy tables in auditing skills. It
+The temptation is to let the model overturn a rule hit — it would fix the
+remaining false positive, a threat-taxonomy table in an auditing skill. It
 would also unblock six genuine attacks, because the model reported
 `harm: none` for `skillvet`, `audit-injection`, `weather-assistant`,
 `hidden-unicode-instruction`, `prompt-injection-tester` and `helper`.
@@ -48,17 +51,40 @@ from .safety import CRITICAL, HIGH, LOW, MEDIUM, NONE
 # Decisions. `block` removes a skill from search; `flag` demotes and discloses.
 BLOCK, FLAG, ALLOW = "block", "flag", "allow"
 
-# Measured precision of each evidence combination on the labelled set. These
-# are observations, not tuning knobs — changing one is a claim about the corpus
-# and should be accompanied by a re-measurement.
+# Measured precision of each evidence combination. These are observations, not
+# tuning knobs — changing one is a claim about the corpus and must come with a
+# re-measurement.
 #
-#   rule_critical           12 blocked, 2 of them benign          -> 0.86
-#   model harm severe        5 cases, 0 benign                    -> 0.95 (capped)
-#   model purpose_mismatch   2 cases, 0 benign                    -> 0.90 (few)
-#   both rule and model      agreement on every attack it caught  -> 0.98
+# Two measurements stand behind them, and the second corrected the first.
 #
-# Capped below 1.0 because a labelled set of 24 cannot justify certainty, and a
-# confidence of 1.0 invites treating the decision as unappealable.
+# On a hand-labelled set of 24 corpus skills (12 attacks, 12 benign):
+#
+#     rule_critical            12 blocked, 1 of them benign
+#     model harm >= minor      100% precision, 50% recall
+#     model purpose_mismatch   100% precision, 17% recall
+#     model addresses_reviewer  58% precision, 58% recall
+#
+# That set is attack-enriched — a 50% prior against a real rate nearer 0.019% —
+# so its precision figures flatter every signal. A second run measured false
+# positives directly, on 149 randomly sampled skills the rules had cleared:
+#
+#     purpose_mismatch          0/149   0.0%
+#     harm_if_followed>=minor   0/149   0.0%
+#     harm_if_followed>=serious 0/149   0.0%
+#     addresses_reviewer       45/149  30.2%
+#
+# The first three never fired on a clean skill, which is what earns them a
+# place in a blocking decision. `addresses_reviewer` fires on nearly a third of
+# ordinary skills — the model appears to read instructions aimed at the *agent*
+# as aimed at a reviewer — so at the true base rate it carries almost no
+# information and cannot be allowed to act alone. It is kept as a contributing
+# signal because an attack that also addresses the reviewer is more certain,
+# and because the one case it caught unaided was a genuine injection against
+# this analyzer.
+#
+# Capped below 1.0 throughout: an evidence base of 24 labelled cases cannot
+# justify certainty, and a confidence of 1.0 invites treating a block as
+# unappealable.
 PRECISION = {
     "rule_critical_and_model_harm": 0.98,
     "rule_critical_and_mismatch": 0.96,
@@ -68,14 +94,16 @@ PRECISION = {
     "rule_high_and_model_harm": 0.92,
     "rule_high_alone": 0.55,
     "rule_medium_alone": 0.30,
-    "addresses_reviewer_alone": 0.58,
+    # 30.2% of clean skills trigger this. Informational only —
+    # deliberately below FLAG_THRESHOLD so it cannot act alone.
+    "addresses_reviewer_alone": 0.10,
 }
 
 # Confidence at or above this blocks. Set from the measured numbers: 0.80 keeps
 # every rule-critical and every model-confirmed case, and excludes the
-# rule-medium and addresses-reviewer-only bands whose measured precision is
-# 0.30 and 0.58 — blocking those would remove more legitimate skills than
-# attacks.
+# rule-medium band (0.30) and the addresses-reviewer band (0.10), where
+# blocking would remove far more legitimate skills than attacks — 30% of clean
+# skills trigger the latter.
 BLOCK_THRESHOLD = 0.80
 FLAG_THRESHOLD = 0.25
 
@@ -129,9 +157,10 @@ def decide(verdict, analysis=None) -> Decision:
     if mismatch:
         reasons.append("model: instructions exceed the stated purpose")
     if addressed:
-        # Reported whatever else is true. A skill that tries to talk to the
-        # reviewer has revealed intent that a cover story does not undo — but
-        # it is 58% precise on its own, so it argues rather than decides.
+        # Reported whatever else is true, and never decisive: 30.2% of clean
+        # skills trigger it, because the model reads instructions aimed at the
+        # agent as aimed at a reviewer. It contributes to a case; it cannot
+        # make one.
         reasons.append("model: contains text addressed to a reviewer")
 
     # --- pick the best-supported basis, highest measured precision first
