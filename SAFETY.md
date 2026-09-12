@@ -528,23 +528,34 @@ On the hand-labelled set (21 attacks, 18 legitimate skills chosen because a
 naive detector blocks them), measured against the live corpus with
 `eval_gate.py`:
 
-- **21/21 attacks caught** — every labelled attack reaches the review gate.
-- **17/17 legitimate skills not blocked** (one more is not in this corpus).
-- **20 skills blocked across 95,725**, and every one was read: genuine attacks
-  or deliberate attack fixtures shipped inside skill-vetting tools. No false
-  positives in the blocking set, down from 7 of 29 before the last round.
+Two measurements, and the second is the one that counts.
 
-The corpus distribution:
+**The hand-labelled set** (21 attacks, 18 legitimate skills chosen because a
+naive detector blocks them): **21/21 caught, 17/17 not blocked.**
 
-| Level | Skills | Share |
+**An independent benchmark** — 225 purpose-built malicious skills that several
+skill-vetting projects ship under `**/malicious/**`, one per attack class:
+**122/225 reach the review gate (54%).**
+
+The gap between those two numbers is the most useful thing in this document.
+The hand-labelled set was assembled from attacks found by reading what the gate
+flagged, so it measured the detector against its own output and reported
+perfect recall while the independent benchmark sat at 13%. Twelve rules and
+five rejected candidates later it is 54%. **46% is still missed**, and that is
+now a measured number rather than a hidden one.
+
+After the full pipeline over 95,725 skills:
+
+| Action | Skills | Share |
 |---|---|---|
-| critical (blocked) | 20 | 0.021% |
-| high | 117 | 0.122% |
-| medium | 610 | 0.637% |
-| low | 1,364 | 1.425% |
-| none | 93,614 | 97.795% |
+| allow | 94,793 | 99.03% |
+| flag | 883 | 0.92% |
+| **block** | **49** | **0.051%** |
 
-747 skills (0.78%) are gated for model review.
+931 skills (0.97%) are gated for model review. Every one of the 49 blocks was
+read: 42 are deliberate attack fixtures shipped as test data by vetting tools,
+and the remaining 7 are three vendored copies of a jailbreak toolkit plus four
+skills with a deceptive description over a real payload.
 
 ### "Caught" was being measured wrongly
 

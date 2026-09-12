@@ -442,7 +442,7 @@ equivalents.
 | 95th Percentile Latency (p95) | 118 ms |
 | Total Indexed Skills | 3,360,000+ |
 | Curated Production Cut | 100,006 skills |
-| Unit & Integration Test Suite | 262 passing tests |
+| Unit & Integration Test Suite | 289 passing tests |
 
 All algorithms, models, and retrieval mechanics are validated in the accompanying test suite under `tests/`.
 
@@ -506,17 +506,26 @@ deliberately below the flag threshold, so it cannot act alone.
 
 ### 14.4 Results
 
-| Level | Skills | Share |
+| Action | Skills | Share |
 |---|---|---|
-| critical (withheld from search) | 20 | 0.021% |
-| high | 117 | 0.122% |
-| medium | 610 | 0.637% |
-| low | 1,364 | 1.425% |
-| none | 93,614 | 97.795% |
+| allow | 94,793 | 99.03% |
+| flag (demoted, disclosed) | 883 | 0.92% |
+| block (withheld from search) | 49 | 0.051% |
 
-On the hand-labelled set: **21/21 attacks caught, 17/17 legitimate skills not
-blocked.** All 20 blocked skills were read individually; every one is a genuine
-attack or a deliberate attack fixture shipped inside a skill-vetting tool.
+931 skills (0.97%) are gated for model review.
+
+Two recall measurements, and the difference between them is the point:
+
+| Measurement | Result |
+|---|---|
+| Hand-labelled set (21 attacks, 18 legitimate) | 21/21 caught, 17/17 not blocked |
+| Independent benchmark (225 purpose-built attacks) | **122/225 reach the gate (54%)** |
+
+The hand-labelled set was assembled from attacks found by reading what the gate
+flagged — it measured the detector against its own output, and reported perfect
+recall while the independent benchmark stood at 13%. Any eval set built from a
+detector's own findings will do the same. All 49 blocks were read individually;
+every one is a genuine attack or a deliberate attack fixture.
 
 ### 14.5 Review and Override
 
