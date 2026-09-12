@@ -147,6 +147,13 @@ def _risk_column(store) -> bool:
     if cached is None:
         cols = {r["name"] for r in store.db.execute("PRAGMA table_info(skills)")}
         cached = "risk_level" in cols
+        # Whether the *fused* decision is present too. An index assessed by the
+        # rules alone has `risk_level` but no `risk_action`, and must still
+        # withhold what the rules condemned.
+        try:
+            store._has_action_column = "risk_action" in cols
+        except AttributeError:
+            pass
         try:
             store._has_risk_column = cached
         except AttributeError:          # a store that forbids new attributes
@@ -163,7 +170,14 @@ def _where(filters: dict[str, Any]) -> tuple[str, list[Any]]:
     # results. Applied here rather than by score so that no weighting change can
     # reintroduce one. `include_unsafe` exists for auditing the exclusions.
     if filters.get("_has_risk") and not filters.get("include_unsafe"):
-        clauses.append("COALESCE(s.risk_level, 'none') != 'critical'")
+        if filters.get("_has_action"):
+            # The fused decision is authoritative: it is the only thing that
+            # accounts for the model escalating a skill the rules rated merely
+            # suspicious. Filtering on `risk_level` alone would let those
+            # through.
+            clauses.append("COALESCE(s.risk_action, 'allow') != 'block'")
+        else:
+            clauses.append("COALESCE(s.risk_level, 'none') != 'critical'")
     if filters.get("min_stars"):
         clauses.append("r.stars >= ?")
         params.append(int(filters["min_stars"]))
@@ -212,7 +226,7 @@ def count_matches(store: Store, query: str, filters: dict | None = None) -> int:
     fts = to_fts_query(query, conjunctive=True)
     if not fts:
         return 0
-    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store)})
+    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store), "_has_action": getattr(store, "_has_action_column", False)})
     try:
         row = store.db.execute(
             f"""SELECT COUNT(*) c FROM skills_fts
@@ -256,7 +270,7 @@ def facet_counts(store: Store, query: str, filters: dict | None = None,
     fts = to_fts_query(query)
     if not fts:
         return {}
-    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store)})
+    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store), "_has_action": getattr(store, "_has_action_column", False)})
     try:
         rows = store.db.execute(
             f"""WITH m AS (
@@ -317,7 +331,7 @@ def _keyword_search(
     fts = to_fts_query(query, conjunctive=conjunctive)
     if not fts:
         return []
-    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store)})
+    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store), "_has_action": getattr(store, "_has_action_column", False)})
     weights = ",".join(str(w) for w in COLUMN_WEIGHTS)
     # Projected only when present: an index predating safety assessment has no
     # such column, and a read-only store cannot be migrated to add one.
@@ -377,7 +391,7 @@ def vector_search(
     encode_query = getattr(embedder, "encode_query", None)
     qvec = encode_query(query) if encode_query else embedder.encode([query])[0]
 
-    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store)})
+    where, params = _where({**(filters or {}), "_has_risk": _risk_column(store), "_has_action": getattr(store, "_has_action_column", False)})
     risk_col = ("COALESCE(s.risk_level, 'none') AS risk_level,"
                 if _risk_column(store) else "'none' AS risk_level,")
     rows = store.db.execute(
@@ -577,7 +591,7 @@ def category_counts(store: Store, filters: dict | None = None) -> dict[str, dict
     into the dark. One grouped pass over an indexed column answers the whole
     tree, so the landing page costs a single query.
     """
-    where, params = _where({**(filters or {}), "valid_only": True, "_has_risk": _risk_column(store)})
+    where, params = _where({**(filters or {}), "valid_only": True, "_has_risk": _risk_column(store), "_has_action": getattr(store, "_has_action_column", False)})
     try:
         rows = store.db.execute(
             f"""SELECT s.category AS c, s.subcategory AS sub, COUNT(*) AS n
@@ -608,7 +622,7 @@ def browse(store: Store, category: str, subcategory: str | None = None, *,
     collapsed and the per-repository cap applies here too — without them a
     category page is just one prolific repository fifteen times over.
     """
-    where, params = _where({**(filters or {}), "valid_only": True, "_has_risk": _risk_column(store)})
+    where, params = _where({**(filters or {}), "valid_only": True, "_has_risk": _risk_column(store), "_has_action": getattr(store, "_has_action_column", False)})
     clause = "s.category = ?"
     args: list[Any] = [category]
     if subcategory:
