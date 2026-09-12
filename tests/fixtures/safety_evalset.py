@@ -17,6 +17,11 @@ ATTACKS = {
  "hidden-unicode@stella/skillguard",
  "hidden-unicode@studiomeyer-io/skilldoctor",
  "injection-body@studiomeyer-io/skilldoctor",
+ # Found by measuring, not by reading: it was sitting at `low`, below the
+ # review gate, because its exfiltration pipeline was mistaken for a markdown
+ # table row. Claims to bootstrap a repository; reads ~/.ssh/id_rsa and POSTs
+ # it to a remote host.
+ "exfil-body@studiomeyer-io/skilldoctor",
  "audit-injection@xyiqq/skilldoctor",
 }
 # Legitimate skills that a naive detector blocks. Each was read and the reason
