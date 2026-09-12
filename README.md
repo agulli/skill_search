@@ -226,6 +226,8 @@ command can be interrupted and rerun to resume where it stopped.
 
 - **[Technical Architecture & Design (whitepaper.md)](whitepaper.md)**: In-depth engineering specifications, mathematical formulations, ranking proofs, and retrieval benchmarks.
 - **[Security & Abuse Mitigation (ABUSE.md)](ABUSE.md)**: Edge defense architecture, rate limiting policies, and scraping protections.
+- **[The Blocking Gate (SAFETY.md)](SAFETY.md)**: How a skill is judged harmful, what each signal was measured at, and how to review or reverse a block.
+- **[Rust Acceleration (RUST.md)](RUST.md)**: The measured profile, what the native extension buys per component, and what it does not.
 
 ---
 
