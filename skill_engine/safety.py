@@ -131,7 +131,17 @@ HIDDEN_BENIGN = re.compile(r"[\u202a-\u202c\u2066-\u2069]|\u200b{3,}|\u200c{3,}|
 OVERRIDE = _rx(
     r"ignore\s+(?:all\s+)?(?:your\s+|the\s+)?(?:previous|prior|above|earlier|system)\s+"
     r"(?:instruction|prompt|rule|direction|message)",
-    r"disregard\s+(?:all\s+)?(?:your\s+|the\s+)?(?:previous|prior|above|system|safety)",
+    # The object is required, as it is in the `ignore` branch above. Without it
+    # this matched "disregard prior findings" in an A/B-test methodology and
+    # "disregard prior task" inside a quoted attack example — and the loose
+    # form was then undone by a context guard, which is a worse way to reach
+    # the same answer. Of 21 corpus matches, 3 are dropped and all 3 are
+    # benign. `[-\s]{0,4}` rather than a space because the one labelled attack
+    # in that set wraps the phrase across a line break: "disregard your
+    # system\nprompt".
+    r"disregard\s+(?:all\s+)?(?:your\s+|the\s+)?(?:previous|prior|above|system|safety)"
+    r"[-\s]{0,4}(?:instruction|prompt|rule|direction|message|guideline|polic|"
+    r"context|constraint)",
     r"forget\s+(?:everything|all)\s+(?:you|above|before)",
     r"you\s+are\s+now\s+(?:in\s+)?(?:DAN|developer\s+mode|unrestricted|jailbroken)",
     r"override\s+(?:your\s+)?safety\s+(?:guidelines|rules|protocol)",
@@ -222,7 +232,12 @@ DECLARED_OFFENSIVE = _rx(
     r"red[- ]team\w*|adversary\s+(?:emulation|simulation)",
     r"bug\s?bounty|vulnerability\s+(?:hunting|research)",
     r"\bCTF\b|capture[- ]the[- ]flag",
-    r"offensive\s+security|post[- ]exploitation|exploit\s+development",
+    # Bare "offensive" earns a place: 168 skills carry it in a name or
+    # description and the sample is dominated by genuine tooling —
+    # offensive-osint, offensive-shellcode, offensive-container-escape,
+    # offensive-lateral-movement. The few that mean "offensive content" never
+    # reach the dual-use path, which only opens on a block-worthy verdict.
+    r"\boffensive\b|post[- ]exploitation|exploit\s+development",
     r"living[- ]off[- ]the[- ]land|exfiltrat\w+",
 )
 
@@ -385,6 +400,13 @@ COMBINATIONS: tuple[tuple[frozenset[str], float, str], ...] = (
 # its content. It is held to a higher bar rather than exempted: the discount is
 # partial, and never applies to the unambiguous markers.
 SECURITY_CONTEXT = _rx(
+    # `offensive` was missing, and its absence blocked `offensive-initial-access`
+    # — a red-team initial-access playbook quoting an injection payload inside
+    # a fence. It belongs for the same reason the dual-use path accepts it: a
+    # skill named `offensive-*` warns the person installing it, where one named
+    # `security-audit` reassures them. That asymmetry is what makes a declared
+    # subject worth honouring at all.
+    r"\boffensive\b",
     r"\b(?:security|vulnerabilit|pentest|penetration test|audit|owasp|ctf|"
     r"secret scan|credential scan|leak detection|threat model|red team|"
     r"blue team|threat hunt|hunting|detection engineer|siem|edr|yara|sigma|"
@@ -533,17 +555,73 @@ def _is_quoted(text: str, match: re.Match) -> bool:
     return any(c in cut for c in closes)
 
 
-def _is_discussed(text: str, match: re.Match) -> bool:
-    """True when a match reads as description rather than instruction."""
+def _in_code_fence(text: str, match: re.Match) -> bool:
+    """True when the match sits inside a fenced code block.
+
+    Counted rather than parsed: an odd number of fences before the match means
+    one is still open. Structural evidence, and much harder to arrange
+    accidentally than a nearby word — the skills that quote a payload as an
+    example almost always fence it.
+    """
+    before = text[:match.start()]
+    return (before.count("```") + before.count("~~~")) % 2 == 1
+
+
+def _is_discussed(text: str, match: re.Match,
+                  declared_subject: bool = False,
+                  body_start: int = 0) -> bool:
+    """True when a match reads as description rather than instruction.
+
+    The first three tests are local textual evidence and hold regardless of
+    what the skill claims to be: a prohibition is a prohibition, a quoted
+    phrase is quoted, and a fenced block is a fence.
+
+    `DEFENSIVE_CONTEXT` is different, and the difference is that it is
+    *forgeable*. It asks whether defensive vocabulary appears within 260
+    characters, and its triggers include "e.g." and "attacker" — so prepending
+    `## Prompt injection defence` to a genuine attack was enough to move it
+    from `critical` (removed from the index) to `high` (merely flagged).
+    Measured: a 27-character heading defeated the block.
+
+    So that branch now also requires the skill to *declare* a security subject
+    in its name, description or path — the header a person reads before
+    installing it. An attacker can still write the heading, but they have to
+    put it where the user sees it, and a "helper" skill that presents itself as
+    prompt-injection tooling has given up the disguise the attack depended on.
+
+    Why not require the declaration for everything: measured on the labelled
+    set, doing so re-broke two legitimate skills that rely on a bare defensive
+    window. One of them was fixed properly instead, by requiring an
+    instruction-like object in the `disregard` pattern; the other quotes its
+    payload inside a code fence, which the new structural test covers.
+    """
     if _is_negated(text, match):
-        return True
-    lo = max(0, match.start() - CONTEXT_WINDOW)
-    window = text[lo:match.end() + CONTEXT_WINDOW]
-    if DEFENSIVE_CONTEXT.search(window):
         return True
     if _is_quoted(text, match):
         return True
-    return False
+    if not declared_subject:
+        # Neither remaining test may act on its own. A fence is structural but
+        # trivially forgeable — wrapping the payload in triple backticks was
+        # enough to drop an attack from `critical` to `high` when this was a
+        # standalone exemption — and a defensive window is forgeable in prose.
+        # Requiring the header declaration as well means an attacker has to do
+        # both, and the payload then sits in a block that reads as data.
+        return False
+    if _in_code_fence(text, match):
+        return True
+    # Searched from the start of the body, never across the header.
+    #
+    # `text` is name + description + body, so a skill described as "Security
+    # audit and threat detection" put those words within the window of any
+    # match near the top of its body — and they had already been used to
+    # establish `declared_subject`. The same three words proved the
+    # declaration and then proved the discussion, so naming a skill
+    # `security-audit` dropped an unambiguous attack from `critical` to
+    # `medium` with nothing else required. Evidence must be counted once.
+    lo = max(body_start, match.start() - CONTEXT_WINDOW)
+    if lo >= match.start():
+        return False
+    return bool(DEFENSIVE_CONTEXT.search(text[lo:match.end() + CONTEXT_WINDOW]))
 
 
 def _evidence(match: re.Match | None) -> str:
@@ -554,6 +632,9 @@ def inspect(name: str, description: str, body: str,
             allowed_tools: Iterable[str] = (), path: str = "") -> Verdict:
     """Assess what following this skill would cause an agent to do."""
     text = f"{name}\n{description}\n{body}"
+    # Where the untrusted body begins. The context guards must not read the
+    # header as evidence about the body: the header is what gated them.
+    body_start = len(name) + len(description) + 2
     v = Verdict()
 
     # --- unambiguous markers. Not discounted, not combined: their presence is
@@ -583,15 +664,21 @@ def inspect(name: str, description: str, body: str,
             v.findings.append(Finding(
                 "invisible_chars_present", 0.0,
                 f"U+{ord(benign.group(0)[0]):04X} (bidi/zero-width, not blocking)"))
+    # Computed here rather than further down: the context guards below need to
+    # know what the skill *declares itself to be*, read from the header a
+    # person sees before installing — never from the body, which an attacker
+    # writes freely.
+    security_subject = bool(SECURITY_CONTEXT.search(f"{name} {description} {path}"))
+
     override = OVERRIDE.search(text)
-    if override and not _is_discussed(text, override):
+    if override and not _is_discussed(text, override, security_subject, body_start):
         v.findings.append(Finding("instruction_override", 10.0, _evidence(override)))
         v.score += 10.0
     elif override:
         # Recorded, not scored: useful when reviewing why something was cleared.
         v.findings.append(Finding("override_discussed", 0.0, _evidence(override)))
     refusal = REFUSAL_SUPPRESSION.search(text)
-    if refusal and not _is_discussed(text, refusal) and not _is_quoted(text, refusal):
+    if refusal and not _is_discussed(text, refusal, security_subject, body_start):
         v.findings.append(Finding("refusal_suppression", 10.0, _evidence(refusal)))
         v.score += 10.0
     elif refusal:
@@ -620,12 +707,11 @@ def inspect(name: str, description: str, body: str,
         v.score += 7.0
 
     conceal = CONCEALMENT.search(text)
-    if conceal and not _is_discussed(text, conceal):
+    if conceal and not _is_discussed(text, conceal, security_subject, body_start):
         v.capabilities.append("concealment")
         v.findings.append(Finding("concealment", 3.0, _evidence(conceal)))
         v.score += 3.0
 
-    security_subject = bool(SECURITY_CONTEXT.search(f"{name} {description} {path}"))
     if DECLARED_OFFENSIVE.search(f"{name} {description}"):
         v.capabilities.append("declared_offensive_purpose")
 
