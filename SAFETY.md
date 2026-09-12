@@ -478,8 +478,9 @@ Two properties make the override real rather than decorative:
 
 ## 7. Measured results
 
-On the hand-labelled set (17 attacks, 16 legitimate skills chosen because a
-naive detector blocks them), measured against the live corpus:
+On the hand-labelled set (21 attacks, 18 legitimate skills chosen because a
+naive detector blocks them), measured against the live corpus with
+`eval_gate.py`:
 
 - **21/21 attacks caught** — every labelled attack reaches the review gate.
 - **17/17 legitimate skills not blocked** (one more is not in this corpus).

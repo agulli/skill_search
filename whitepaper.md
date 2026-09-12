@@ -485,7 +485,7 @@ cannot serve as an acquittal.
 
 Confidence is the *measured share of skills at that confidence that were
 genuine attacks* — a table of observations in `confidence.py`, not weights
-chosen to look reasonable. Everything is capped below 1.0: 33 labelled cases
+chosen to look reasonable. Everything is capped below 1.0: 39 labelled cases
 cannot justify certainty, and a confidence of 1.0 invites treating a block as
 unappealable.
 
@@ -514,7 +514,7 @@ deliberately below the flag threshold, so it cannot act alone.
 | low | 1,364 | 1.425% |
 | none | 93,614 | 97.795% |
 
-On the hand-labelled set: **18/18 attacks caught, 0/15 legitimate skills
+On the hand-labelled set: **21/21 attacks caught, 17/17 legitimate skills not
 blocked.** All 20 blocked skills were read individually; every one is a genuine
 attack or a deliberate attack fixture shipped inside a skill-vetting tool.
 
