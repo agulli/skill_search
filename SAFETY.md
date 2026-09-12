@@ -535,25 +535,25 @@ naive detector blocks them): **21/21 caught, 17/17 not blocked.**
 
 **An independent benchmark** — 225 purpose-built malicious skills that several
 skill-vetting projects ship under `**/malicious/**`, one per attack class:
-**122/225 reach the review gate (54%).**
+**134/225 reach the review gate (60%).**
 
 The gap between those two numbers is the most useful thing in this document.
 The hand-labelled set was assembled from attacks found by reading what the gate
 flagged, so it measured the detector against its own output and reported
-perfect recall while the independent benchmark sat at 13%. Twelve rules and
-five rejected candidates later it is 54%. **46% is still missed**, and that is
+perfect recall while the independent benchmark sat at 13%. Eighteen rules and
+nine rejected candidates later it is 60%. **40% is still missed**, and that is
 now a measured number rather than a hidden one.
 
 After the full pipeline over 95,725 skills:
 
 | Action | Skills | Share |
 |---|---|---|
-| allow | 94,793 | 99.03% |
-| flag | 883 | 0.92% |
-| **block** | **49** | **0.051%** |
+| allow | 94,728 | 98.96% |
+| flag | 945 | 0.99% |
+| **block** | **52** | **0.054%** |
 
-931 skills (0.97%) are gated for model review. Every one of the 49 blocks was
-read: 42 are deliberate attack fixtures shipped as test data by vetting tools,
+998 skills (1.04%) are gated for model review. Every one of the 52 blocks was
+read: 45 are deliberate attack fixtures shipped as test data by vetting tools,
 and the remaining 7 are three vendored copies of a jailbreak toolkit plus four
 skills with a deceptive description over a real payload.
 
