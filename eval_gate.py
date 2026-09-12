@@ -141,6 +141,38 @@ def main() -> int:
     if blocked_benign:
         print(f"  FALSE POSITIVES: {blocked_benign}")
 
+    # ---------------------------------------- the independent benchmark
+    #
+    # Several skill-vetting projects ship purpose-built malicious skills under
+    # `**/malicious/**`, one per attack class. This is the honest recall
+    # measure, and it exists because the hand-labelled set above was not one:
+    # that set was assembled from attacks found by looking at what the gate
+    # flagged, so it reported 21/21 while an independent benchmark of 225
+    # attacks was 87% allowed.
+    print(f"\n  independent benchmark (skills under a '/malicious/' path)")
+    print("  " + "-" * 74)
+    bench = store.db.execute(
+        "SELECT name, repo, description, body, allowed_tools, path FROM skills "
+        "WHERE path LIKE '%/malicious/%' AND valid = 1").fetchall()
+    levels: Counter = Counter()
+    below = []
+    for row in bench:
+        v = verdict_for(store, row)
+        levels[v.level] += 1
+        if v.level not in GATED:
+            below.append((row["path"], row["description"] or ""))
+    gated_n = len(bench) - len(below)
+    for level in (CRITICAL, HIGH, MEDIUM, "low", NONE):
+        if levels[level]:
+            print(f"    {level:10}{levels[level]:>6}")
+    if bench:
+        print(f"  reaching the review gate: {gated_n}/{len(bench)} "
+              f"({100 * gated_n / len(bench):.0f}%)")
+    if below and args.blocks:
+        print(f"\n  below the gate, and so never modelled ({len(below)}):")
+        for path, desc in below[:40]:
+            print(f"    {path[:60]:<62}{desc[:40]}")
+
     # ------------------------------------------------------ the whole corpus
     print(f"\n  scanning the corpus…")
     t0 = time.perf_counter()
