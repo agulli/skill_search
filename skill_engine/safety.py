@@ -696,7 +696,8 @@ def _needs_inspection(rows: list[Any]) -> list[int] | None:
     return sorted(candidates)
 
 
-def assess_corpus(store, *, batch: int = 5000) -> dict[str, Any]:
+def assess_corpus(store, *, batch: int = 5000,
+                  skip_assessed: bool = False) -> dict[str, Any]:
     """Inspect every skill and record its verdict.
 
     Run as a batch stage rather than at parse time: inspection costs about a
@@ -710,9 +711,24 @@ def assess_corpus(store, *, batch: int = 5000) -> dict[str, Any]:
     pending: list[tuple[str, str, int]] = []
     flagged_examples: list[dict[str, Any]] = []
 
+    # `skip_assessed` keeps a release build from overwriting decisions already
+    # made against *full* bodies. Assessing a shipped artifact is measurably
+    # weaker: bodies are truncated to 2,000 characters for the index, and 2 of
+    # 14 labelled attacks lose their verdict entirely under that cut, because
+    # their payload sits past the truncation point. So the model pass runs once
+    # against the crawl database and releases inherit it.
+    where = ""
+    if skip_assessed:
+        cols = {r["name"] for r in store.db.execute("PRAGMA table_info(skills)")}
+        if "risk_confidence" in cols:
+            where = " WHERE risk_confidence IS NULL"
     all_rows = store.db.execute(
-        "SELECT id, name, description, body, allowed_tools, path, repo FROM skills"
+        "SELECT id, name, description, body, allowed_tools, path, repo "
+        f"FROM skills{where}"
     ).fetchall()
+    if skip_assessed and not all_rows:
+        log.info("every skill already carries a decision; assessment skipped")
+        return {"counts": {}, "flagged": [], "skipped": True}
 
     # With the accelerator present, only the gated candidates are inspected and
     # everything else is recorded clean without running the rules. Without it,

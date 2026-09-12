@@ -76,7 +76,9 @@ def main() -> int:
 
     # 3. Compute corpus-relative quality rankings
     t = log_step("Inspecting what each skill instructs an agent to do")
-    risk = assess_corpus(store)
+    # Inherit any decision already made against the untruncated crawl database
+    # rather than recomputing from what is about to be trimmed.
+    risk = assess_corpus(store, skip_assessed=True)
     counts = risk["counts"]
     print(f"    " + ", ".join(f"{k} {v:,}" for k, v in sorted(counts.items())))
     if counts.get("critical"):
