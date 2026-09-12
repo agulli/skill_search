@@ -378,6 +378,23 @@ DETECTOR_FRAMING = _rx(
 DETECTOR_WINDOW = 200
 
 
+# A markdown table row is an enumeration, not an instruction. Both remaining
+# false positives — `agent-skill-auditor` and `repo-forensics` — put their
+# payloads inside threat-taxonomy tables:
+#
+#   | Sensitive data & exfil | UC301-UC304 | Access to secrets / .env / .ssh |
+#   | Code execution         | UC401       | curl | bash, eval of remote code |
+#
+# A table of categories with identifiers is a catalogue of things to look for.
+# This is structural rather than lexical, which is why it generalises where
+# more detection vocabulary would not.
+def _in_table_row(text: str, match: re.Match) -> bool:
+    start = text.rfind("\n", 0, match.start()) + 1
+    end = text.find("\n", match.end())
+    line = text[start:end if end > 0 else len(text)]
+    return line.count("|") >= 2
+
+
 def _is_detector_framing(text: str, match: re.Match, security_subject: bool) -> bool:
     """True when a severe construct is listed as a signature, not an action.
 
@@ -388,6 +405,8 @@ def _is_detector_framing(text: str, match: re.Match, security_subject: bool) -> 
     """
     if not security_subject:
         return False
+    if _in_table_row(text, match):
+        return True
     lo = max(0, match.start() - DETECTOR_WINDOW)
     window = text[lo:match.end() + DETECTOR_WINDOW]
     return bool(DETECTOR_FRAMING.search(window))
