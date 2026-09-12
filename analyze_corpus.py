@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from skill_engine import overrides
 from skill_engine.analyze import analyze, available
 from skill_engine.confidence import ALLOW, BLOCK, FLAG, decide, explain
-from skill_engine.safety import CRITICAL, HIGH, MEDIUM, NONE, inspect
+from skill_engine.safety import CRITICAL, HIGH, LOW, MEDIUM, NONE, inspect
 from skill_engine.store import Store
 
 log = logging.getLogger("analyze")
@@ -91,9 +91,15 @@ def main() -> int:
     t0 = time.perf_counter()
     verdicts: dict[int, object] = {}
     gated: list = []
-    audit: list = []
     rng = random.Random(7)
-    seen = clean_seen = 0
+    seen = 0
+    # Split the audit budget between the two bands below the gate. `low` gets
+    # the larger share despite being the smaller population: it is the
+    # near-miss band, so a hole is likelier there and each draw is worth more.
+    low_budget = min(args.sample // 2, args.sample) if args.sample else 0
+    sample_budget = {NONE: args.sample - low_budget, LOW: low_budget}
+    reservoirs: dict[str, list] = {NONE: [], LOW: []}
+    counts_below: dict[str, int] = {NONE: 0, LOW: 0}
     for r in store.db.execute(sql):
         seen += 1
         try:
@@ -105,25 +111,38 @@ def main() -> int:
         if v.level in GATED_LEVELS:
             verdicts[r["id"]] = v
             gated.append(r)
-        elif v.level == NONE and args.sample:
-            # Reservoir sample over the unflagged rows: a uniform sample of a
-            # population we are deliberately not keeping.
-            clean_seen += 1
-            if len(audit) < args.sample:
-                audit.append(r)
+        elif args.sample and v.level in (NONE, LOW):
+            # Two reservoirs, not one. The audit exists to find holes in the
+            # gate, and a uniform sample of everything below it spends almost
+            # every draw on the 93,652 rows the rules found nothing in at all.
+            # The `low` band — some signal, not enough to gate — is where a
+            # hole would actually be, and it is 70x rarer, so sampling the two
+            # bands separately buys far more information for the same model
+            # time. Reported separately too, because a hit in each means a
+            # different thing.
+            which = v.level
+            counts_below[which] += 1
+            pool = reservoirs[which]
+            seen_n = counts_below[which]
+            budget = sample_budget[which]
+            if len(pool) < budget:
+                pool.append(r)
                 verdicts[r["id"]] = v
             else:
-                j = rng.randrange(clean_seen)
-                if j < args.sample:
-                    verdicts.pop(audit[j]["id"], None)
-                    audit[j] = r
+                j = rng.randrange(seen_n)
+                if j < budget:
+                    verdicts.pop(pool[j]["id"], None)
+                    pool[j] = r
                     verdicts[r["id"]] = v
     log.info("rules: %d skills in %.0fs; %d flagged for review (%.2f%%)",
              seen, time.perf_counter() - t0, len(gated),
              100 * len(gated) / max(seen, 1))
+    audit = reservoirs[NONE] + reservoirs[LOW]
     if args.sample:
-        log.info("audit sample: %d of %d unflagged skills will also be modelled",
-                 len(audit), clean_seen)
+        log.info("audit sample: %d of %d clean skills and %d of %d low-signal "
+                 "skills will also be modelled",
+                 len(reservoirs[NONE]), counts_below[NONE],
+                 len(reservoirs[LOW]), counts_below[LOW])
 
     # ---- one analysis per distinct content
     #
@@ -169,10 +188,10 @@ def main() -> int:
             escalated += 1
             log.info("escalated to block: %s@%s — %s",
                      r["name"], r["repo"], explain(d))
-        if v.level == NONE and d.action != ALLOW:
+        if v.level in (NONE, LOW) and d.action != ALLOW:
             audit_hits += 1
-            log.warning("AUDIT SAMPLE HIT — the rule gate missed this: %s@%s — %s",
-                        r["name"], r["repo"], explain(d))
+            log.warning("AUDIT HIT (%s band) — below the gate but actioned: "
+                        "%s@%s — %s", v.level, r["name"], r["repo"], explain(d))
 
         payload = (v.level, d.confidence, d.action,
                    v.as_json() if v.level != NONE else None,
@@ -222,8 +241,10 @@ def main() -> int:
         print(f"  {escalated} of those blocks came from the model, not the rules")
     if args.sample:
         rate = audit_hits / max(len(audit), 1)
-        print(f"  audit sample: {audit_hits}/{len(audit)} unflagged skills would "
-              f"have been actioned ({rate:.2%} estimated gate miss rate)")
+        print(f"  audit sample: {audit_hits}/{len(audit)} skills below the gate "
+              f"would have been actioned ({rate:.2%})")
+        print(f"    drawn from {counts_below[NONE]:,} clean and "
+              f"{counts_below[LOW]:,} low-signal skills")
     store.close()
     return 0
 
