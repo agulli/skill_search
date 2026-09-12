@@ -210,9 +210,15 @@ def main() -> int:
         # Committed per row: an interrupted two-hour job must not start over.
         store.commit()
         if i % 25 == 0 or i == len(todo):
-            rate = i / max(time.perf_counter() - t0, 1e-9)
-            log.info("  %d/%d  %.1f/s  eta %.0f min  [block %d flag %d allow %d]",
-                     i, len(todo), rate, (len(todo) - i) / rate / 60,
+            # Seconds per skill, not skills per second. The model takes ~24s
+            # each, which printed as "0.0/s" — a progress line that cannot
+            # show progress is how a stalled run passes for a slow one, and
+            # that mistake cost hours earlier in this work.
+            elapsed = max(time.perf_counter() - t0, 1e-9)
+            per = elapsed / i
+            log.info("  %d/%d  %.0fs each  eta %.0f min  "
+                     "[block %d flag %d allow %d]",
+                     i, len(todo), per, (len(todo) - i) * per / 60,
                      counts[BLOCK], counts[FLAG], counts[ALLOW])
 
     # Everything the rules cleared and the model never saw is allowed at zero
