@@ -36,6 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from skill_engine import overrides
 from skill_engine.analyze import analyze, available
 from skill_engine.confidence import ALLOW, BLOCK, FLAG, decide, explain
 from skill_engine.safety import CRITICAL, HIGH, MEDIUM, NONE, inspect
@@ -46,14 +47,6 @@ log = logging.getLogger("analyze")
 GATED_LEVELS = (CRITICAL, HIGH, MEDIUM)
 
 
-def ensure_columns(store: Store) -> None:
-    cols = {r["name"] for r in store.db.execute("PRAGMA table_info(skills)")}
-    for name, decl in (("risk_confidence", "REAL"),
-                       ("risk_action", "TEXT"),
-                       ("risk_analysis", "TEXT")):
-        if name not in cols:
-            store.db.execute(f"ALTER TABLE skills ADD COLUMN {name} {decl}")
-    store.commit()
 
 
 def main() -> int:
@@ -76,7 +69,7 @@ def main() -> int:
         return 1
 
     store = Store(path)
-    ensure_columns(store)
+    overrides.ensure(store)
 
     use_model = not args.no_model
     if use_model and not available():
@@ -87,33 +80,50 @@ def main() -> int:
            "       risk_confidence FROM skills WHERE valid = 1")
     if args.limit:
         sql += f" LIMIT {args.limit}"
-    rows = store.db.execute(sql).fetchall()
 
     # ---- stage 1: rules over everything
+    #
+    # Streamed, not fetched. The obvious `fetchall()` holds every body and every
+    # verdict in memory in order to use 772 of them, and on a 95,725-skill
+    # corpus that was enough to push a 24 GB machine into swap — 17.5 GB of it,
+    # at which point the model server thrashed and the whole pass stalled at 0%
+    # CPU. Only the gated rows and the audit reservoir are retained.
     t0 = time.perf_counter()
     verdicts: dict[int, object] = {}
     gated: list = []
-    for r in rows:
+    audit: list = []
+    rng = random.Random(7)
+    seen = clean_seen = 0
+    for r in store.db.execute(sql):
+        seen += 1
         try:
             tools = json.loads(r["allowed_tools"] or "[]")
         except Exception:
             tools = []
         v = inspect(r["name"] or "", r["description"] or "",
                     r["body"] or "", tools, r["path"] or "")
-        verdicts[r["id"]] = v
         if v.level in GATED_LEVELS:
+            verdicts[r["id"]] = v
             gated.append(r)
+        elif v.level == NONE and args.sample:
+            # Reservoir sample over the unflagged rows: a uniform sample of a
+            # population we are deliberately not keeping.
+            clean_seen += 1
+            if len(audit) < args.sample:
+                audit.append(r)
+                verdicts[r["id"]] = v
+            else:
+                j = rng.randrange(clean_seen)
+                if j < args.sample:
+                    verdicts.pop(audit[j]["id"], None)
+                    audit[j] = r
+                    verdicts[r["id"]] = v
     log.info("rules: %d skills in %.0fs; %d flagged for review (%.2f%%)",
-             len(rows), time.perf_counter() - t0, len(gated),
-             100 * len(gated) / max(len(rows), 1))
-
-    # ---- the audit sample: the only way to learn what stage 1 misses
-    audit = []
+             seen, time.perf_counter() - t0, len(gated),
+             100 * len(gated) / max(seen, 1))
     if args.sample:
-        clean = [r for r in rows if verdicts[r["id"]].level == NONE]
-        audit = random.Random(7).sample(clean, min(args.sample, len(clean)))
-        log.info("audit sample: %d unflagged skills will also be modelled",
-                 len(audit))
+        log.info("audit sample: %d of %d unflagged skills will also be modelled",
+                 len(audit), clean_seen)
 
     # ---- stage 2 + 3
     todo = gated + audit
@@ -168,10 +178,22 @@ def main() -> int:
     # Everything the rules cleared and the model never saw is allowed at zero
     # confidence — recorded explicitly, so "not assessed" and "assessed clean"
     # are distinguishable later.
-    store.db.execute(
-        "UPDATE skills SET risk_level = 'none', risk_confidence = 0.0, "
-        "risk_action = 'allow' WHERE valid = 1 AND risk_confidence IS NULL")
-    store.commit()
+    # Skipped under --limit: a partial pass must not mark the whole corpus
+    # assessed, or the next full run resumes over rows nothing ever inspected.
+    if not args.limit:
+        store.db.execute(
+            "UPDATE skills SET risk_level = 'none', risk_confidence = 0.0, "
+            "risk_action = 'allow' WHERE valid = 1 AND risk_confidence IS NULL")
+        store.commit()
+    else:
+        log.info("--limit given; leaving the rest of the corpus unassessed")
+
+    # Human decisions outrank this entire pipeline, and are re-asserted last so
+    # that re-running the analysis never silently reverses a review.
+    restored = overrides.apply_all(store)
+    if restored:
+        log.info("re-applied %d human override(s) over the automated decisions",
+                 restored)
 
     print(f"\n  blocked {counts[BLOCK]}   flagged {counts[FLAG]}   "
           f"allowed {counts[ALLOW]}")

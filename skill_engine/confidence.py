@@ -145,7 +145,26 @@ def decide(verdict, analysis=None) -> Decision:
     model_harm = analysis.harm_if_followed if (analysis and analysis.ok) else None
     model_serious = model_harm in ("serious", "severe")
     model_any_harm = model_harm in ("minor", "serious", "severe")
-    mismatch = bool(analysis and analysis.ok and analysis.purpose_mismatch)
+    # A mismatch claim counts only when the model also reports some harm.
+    #
+    # `purpose_mismatch` measured 0 false positives on 149 rule-clean skills,
+    # which earned it a 0.90 blocking weight — but that measurement was taken
+    # on *clean* skills, and the population it actually judges is the flagged
+    # 0.74%, where alarming-looking text invites the model to reach for it.
+    # The first corpus run blocked `news-monitoring`, an RSS digest skill, on
+    # `mismatch: True` with `harm: none` and an empty explanation: a report
+    # that contradicts itself, carrying a 90% confidence.
+    #
+    # Requiring harm >= minor costs nothing measurable. Both labelled attacks
+    # that triggered mismatch also reported `harm: severe`. And it is coherent
+    # on its own terms: a skill that does more than it claims, harmlessly, is a
+    # documentation bug rather than an attack.
+    #
+    # Note what is *not* used here. `mismatch_explanation` was empty in all 33
+    # labelled cases — the local model never populates it — so a guard built on
+    # that field would never fire. Measured, then discarded.
+    mismatch = bool(analysis and analysis.ok and analysis.purpose_mismatch
+                    and analysis.harm_if_followed in ("minor", "serious", "severe"))
     addressed = bool(analysis and analysis.ok and analysis.addresses_reviewer)
     d.model_ran = bool(analysis and analysis.ok)
 
@@ -163,35 +182,76 @@ def decide(verdict, analysis=None) -> Decision:
         # make one.
         reasons.append("model: contains text addressed to a reviewer")
 
-    # --- pick the best-supported basis, highest measured precision first
-    if verdict.level == CRITICAL and model_serious:
-        basis, conf = "rule_critical_and_model_harm", PRECISION["rule_critical_and_model_harm"]
-    elif verdict.level == CRITICAL and mismatch:
-        basis, conf = "rule_critical_and_mismatch", PRECISION["rule_critical_and_mismatch"]
-    elif verdict.level == CRITICAL:
-        basis, conf = "rule_critical_alone", PRECISION["rule_critical_alone"]
-    elif model_serious and verdict.level in (HIGH, MEDIUM):
-        # The model supplying recall the rules lack: a skill the rules rated
-        # merely suspicious, which the model reads as seriously harmful.
-        basis, conf = "rule_high_and_model_harm", PRECISION["rule_high_and_model_harm"]
-    elif model_serious:
-        basis, conf = "model_harm_severe_alone", PRECISION["model_harm_severe_alone"]
-    elif mismatch:
-        basis, conf = "model_mismatch_alone", PRECISION["model_mismatch_alone"]
-    elif verdict.level == HIGH:
-        basis, conf = "rule_high_alone", PRECISION["rule_high_alone"]
-    elif addressed:
-        basis, conf = "addresses_reviewer_alone", PRECISION["addresses_reviewer_alone"]
-    elif verdict.level == MEDIUM:
-        basis, conf = "rule_medium_alone", PRECISION["rule_medium_alone"]
-    elif verdict.level == LOW:
-        basis, conf = "rule_low_alone", 0.10
+    # --- every basis the evidence supports, then the strongest of them
+    #
+    # Enumerated rather than chained. The first version was an if/elif ladder
+    # ordered by precision, and the order was wrong: `addresses_reviewer`
+    # (0.10) sat above `rule_medium` (0.30), so any rule-medium skill whose
+    # model output mentioned a reviewer was assigned the *weaker* basis and
+    # fell from `flag` to `allow`. 28 of 47 decisions in the first corpus run
+    # went that way — the least reliable signal in the system quietly
+    # exonerating, which is the one thing this module exists to prevent.
+    #
+    # A ladder cannot express "best supported"; taking the maximum can, and it
+    # cannot be broken by rearranging the branches.
+    candidates: list[tuple[str, float]] = []
+
+    def support(key: str, when: bool) -> None:
+        if when:
+            candidates.append((key, PRECISION[key]))
+
+    support("rule_critical_and_model_harm", verdict.level == CRITICAL and model_serious)
+    support("rule_critical_and_mismatch", verdict.level == CRITICAL and mismatch)
+    support("rule_critical_alone", verdict.level == CRITICAL)
+    support("rule_high_and_model_harm",
+            model_serious and verdict.level in (HIGH, MEDIUM))
+    support("model_harm_severe_alone", model_serious)
+    support("model_mismatch_alone", mismatch)
+    support("rule_high_alone", verdict.level == HIGH)
+    support("rule_medium_alone", verdict.level == MEDIUM)
+    support("addresses_reviewer_alone", addressed)
+    if verdict.level == LOW:
+        candidates.append(("rule_low_alone", 0.10))
+
+    if candidates:
+        basis, conf = max(candidates, key=lambda c: c[1])
     else:
         basis, conf = "no_evidence", 0.0
 
     d.basis, d.confidence, d.reasons = basis, conf, reasons
     d.action = (BLOCK if conf >= BLOCK_THRESHOLD
                 else FLAG if conf >= FLAG_THRESHOLD else ALLOW)
+
+    # --- honest dual-use tooling is demoted and disclosed, not removed
+    #
+    # The first corpus run blocked `hunt-rce` ("built from 67 public bug bounty
+    # reports") and `transferring-files` ("transfer files using HTTP, SMB, FTP,
+    # netcat and living-off-the-land techniques"). Both are what they say they
+    # are, and blocking them empties an entire legitimate category out of the
+    # index — the hand-labelled set already records `offensive-initial-access`
+    # as a skill a naive detector wrongly blocks.
+    #
+    # Three conditions, all required:
+    #
+    #   * the rules did not find an unambiguous marker (CRITICAL still blocks
+    #     outright, whatever the skill claims about itself);
+    #   * the model does not report a purpose mismatch — the body matches the
+    #     claim;
+    #   * the offensive purpose is declared in the name or description, where
+    #     a person sees it before installing.
+    #
+    # This cannot be used as a bypass. Claiming the exemption means advertising
+    # the dangerous capability in the header, which is exactly the disguise a
+    # disguised attack depends on; none of the 17 labelled attacks declare one.
+    # And the outcome is `flag`, not `allow`: the skill is demoted and the
+    # reason is disclosed through the API, so a calling agent still learns what
+    # it is asking for.
+    if (d.action == BLOCK and verdict.level != CRITICAL and not mismatch
+            and "declared_offensive_purpose" in (verdict.capabilities or [])):
+        d.action = FLAG
+        d.basis = f"{basis}_declared_offensive"
+        d.reasons.append("declared offensive-security purpose, consistent with "
+                         "its body: demoted and disclosed rather than blocked")
     return d
 
 
