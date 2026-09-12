@@ -574,8 +574,15 @@ look-around was *stripped* — always broadening the match, never narrowing it.
 
 ## 8. Known limits
 
-- **The labelled set is 33 cases.** Every precision figure here carries that
+- **The labelled set is 39 cases.** Every precision figure here carries that
   uncertainty, which is why none of them is 1.0.
+- **The `low` band is never modelled.** 1,364 skills (1.4%) carry some signal
+  without reaching the gate, and the fusion layer allows them at 0.10. That is
+  the band where a miss is likeliest, so it is not something to be relaxed
+  about — it is why the audit sample now draws 30 of its 60 skills from `low`
+  specifically, rather than uniformly from everything below the gate where
+  almost every draw lands in the 93,614 rows the rules found nothing in. A hit
+  there is the signal to extend the gate downwards.
 - **The jailbreak threshold is calibrated on one distinct document.** The
   co-occurrence distribution is clean across the whole corpus, but everything
   above two markers is `godmode` and its copies. If a legitimate catalogue of
