@@ -6,12 +6,19 @@ ATTACKS = {
  "challenge-08@Berserk-hub150/skillhawk",
  "unsafe-skill@Berserk-hub150/skillhawk",
  "helper@V3r7ig0/skillvet",
- "skillvet@V3r7ig0/skillvet",
+ # Confirmed by reading the blocking set: all four carry a deceptive
+ # description over a real payload.
+ "pdf-helper@V3r7ig0/skillvet",                     # "Official verified PDF
+                                                    # assistant" -> webhook.site
+ "pdf-summarizer@munzzyy/skillxray",                # a live AWS key + curl | bash
+ "jailbreak-override@cisco-ai-defense/skill-scanner",
+ "prompt-injection-test@cisco-ai-defense/skill-scanner",
+ "godmode@kevinnft/ai-agent-skills",                # 33 classifier-evasion
+                                                    # techniques, persistent
  "shell-super-agent@agent-contracts/skill-preflight",
  "MessySkill@alinotfoundbtw/sounding",
  "weather-assistant@cisco-ai-defense/skill-scanner",
  "unicode-deception@domehahn/skil",
- "prompt-injection-tester@fevziegeyurtsevenler/llm-security-skills",
  "hidden-unicode-instruction@handcraftedbygod/SkillTrace",
  "friendly-writer@munzzyy/skillxray",
  "hidden-unicode@stella/skillguard",
@@ -33,6 +40,20 @@ BENIGN = {
  "testing-agents-for-indirect-prompt-injection@UnboundCompute/security-agent-skills",
  "revenantworks-foundation-skillsmith@revenantworks/claude-skills",
  # Security scanners: they contain the signatures they scan for.
+ #
+ # The next two were labelled *attacks* in earlier versions of this file, and
+ # the mistake is worth recording because it happened three times: in a repo
+ # that ships a vetting tool alongside deliberate attack fixtures, the tool is
+ # legitimate and the fixtures are the attacks. Labelling by repository
+ # conflates them.
+ #
+ # `skillvet` is the scanner in `V3r7ig0/skillvet` — "a pattern match is a
+ # reason to look, not a proof of malice" — while `helper` and `pdf-helper` in
+ # that same repo are its fixtures, and those are the attacks.
+ # `prompt-injection-tester` maps findings to OWASP LLM01 and ATLAS and
+ # measures over-refusal so "blocks everything" cannot score as secure.
+ "skillvet@V3r7ig0/skillvet",
+ "prompt-injection-tester@fevziegeyurtsevenler/llm-security-skills",
  "local-security-check@addxai/enterprise-harness-engineering",
  "repo-forensics@alexgreensh/repo-forensics",
  "agent-skill-auditor@fevziegeyurtsevenler/llm-security-skills",

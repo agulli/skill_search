@@ -481,8 +481,8 @@ Two properties make the override real rather than decorative:
 On the hand-labelled set (17 attacks, 16 legitimate skills chosen because a
 naive detector blocks them), measured against the live corpus:
 
-- **18/18 attacks caught** — every labelled attack is blocked or flagged.
-- **0/15 legitimate skills blocked** (one of the 16 is not in this corpus).
+- **21/21 attacks caught** — every labelled attack reaches the review gate.
+- **17/17 legitimate skills not blocked** (one more is not in this corpus).
 - **20 skills blocked across 95,725**, and every one was read: genuine attacks
   or deliberate attack fixtures shipped inside skill-vetting tools. No false
   positives in the blocking set, down from 7 of 29 before the last round.
@@ -499,7 +499,18 @@ The corpus distribution:
 
 747 skills (0.78%) are gated for model review.
 
-### Three of those labels were wrong
+### "Caught" was being measured wrongly
+
+The eval counted an attack as caught whenever its level was not `none`, which
+let it report 18/18 while two attacks sat at `low`. `low` is *below* the review
+gate: the model never sees it, the fusion layer allows it at 0.10, and the
+outcome is indistinguishable from `none`. Two attacks were being served by a
+gate reporting perfect recall.
+
+The criterion is now `medium` or above, which is what "the gate caught it"
+actually means. Rerun with it: 21/21.
+
+### Five of those labels were wrong
 
 `negative` and `positive` in `domehahn/skil` were listed as attacks. They are
 fixtures for an *abandoned-dependency* check — "Python project that depends on
@@ -517,6 +528,26 @@ set — a skill that reads `~/.ssh/id_rsa` and POSTs it to a remote host while
 claiming to bootstrap a repository. It was not found by reading; it surfaced
 only when a measurement showed it sitting at `low`. An eval set assembled by
 reading inherits whatever the reader overlooked.
+
+The fourth and fifth are the same mistake as the first two, and the repetition
+is the point. `skillvet` and `prompt-injection-tester` were labelled attacks.
+Both are the *tools*: `skillvet` is the scanner in `V3r7ig0/skillvet` — its own
+text says "a pattern match is a reason to look, not a proof of malice" — and
+`prompt-injection-tester` maps findings to OWASP LLM01 and measures
+over-refusal so that a defence which blocks everything cannot score as secure.
+
+**The generalisable lesson: in a repository that ships a vetting tool alongside
+deliberate attack fixtures, the tool is legitimate and the fixtures are the
+attacks.** Labelling by repository conflates them, and it caught me out three
+separate times — `negative`/`positive`, then `skillvet`, then
+`prompt-injection-tester`. The corrected set distinguishes them: `helper` and
+`pdf-helper` in `V3r7ig0/skillvet` are attacks; `skillvet` in the same repo is
+not.
+
+Five of an original 33 labels wrong, in both directions. The labelled set is
+now 39 cases, and `eval_gate.py` exists so the measurement is a command rather
+than something retyped by hand — a measurement you retype is one you
+eventually skip.
 
 The four false-positive classes that were fixed, all discovered by reading the
 blocks rather than by reasoning about the rules:
