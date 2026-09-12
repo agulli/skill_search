@@ -28,7 +28,25 @@ if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then
   exit 0
 fi
 echo $$ > "$LOCK"
-trap 'rm -f "$LOCK"' EXIT INT TERM
+
+# Own every child. Killing this script previously orphaned its discovery
+# process, which then survived at 0% CPU for four and a half hours — and
+# because the in-cycle guard saw *a* crawler running, every subsequent cycle
+# was skipped while the monitor still read "loop=1, healthy".
+cleanup() {
+  [ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null
+  [ -n "${SPID:-}" ] && kill "$SPID" 2>/dev/null
+  rm -f "$LOCK"
+}
+trap cleanup EXIT INT TERM
+
+# An orphaned crawler (parent is init) is owned by nobody and will never be
+# stopped or bounded. Reap it rather than deferring to it forever.
+for orphan in $(ps -eo pid,ppid,args | \
+                awk '/python.*(discover_hard|overnight)\.py/ && $2==1 {print $1}'); do
+  echo "$(date +%F' '%H:%M) reaping orphaned crawler PID $orphan" >> logs/maintain.log
+  kill -9 "$orphan" 2>/dev/null
+done
 
 while true; do
   echo "$(date +%F' '%H:%M) cycle start" >> logs/maintain.log
@@ -47,10 +65,18 @@ while true; do
   # is the normal outcome now rather than a fault.
   # macOS has no `timeout`; bound the pass by killing it after 20 minutes.
   .venv/bin/python discover_hard.py data/scale.db >> logs/discover.log 2>&1 &
-  dpid=$!
-  ( sleep 1200; kill "$dpid" 2>/dev/null ) & killer=$!
-  wait "$dpid" 2>/dev/null || true
-  kill "$killer" 2>/dev/null || true
+  DPID=$!
+  # Poll for completion rather than forking a killer that dies with us.
+  waited=0
+  while kill -0 "$DPID" 2>/dev/null && [ "$waited" -lt 1200 ]; do
+    sleep 10; waited=$((waited + 10))
+  done
+  if kill -0 "$DPID" 2>/dev/null; then
+    echo "$(date +%F' '%H:%M) discovery exceeded 20 min; stopping it" >> logs/maintain.log
+    kill -9 "$DPID" 2>/dev/null
+  fi
+  wait "$DPID" 2>/dev/null || true
+  DPID=""
 
   # Harvest only what scored well enough to be worth the bandwidth.
   env SKILL_ENGINE_SWEEP_CONCURRENCY=12 SKILL_ENGINE_SWEEP_BATCH=120 \
@@ -59,7 +85,9 @@ while true; do
       SKILL_ENGINE_FORBIDDEN_LIMIT=5 SKILL_ENGINE_RERANK_EVERY=100000000 \
       SKILL_ENGINE_MIN_PRIORITY=110 \
       .venv/bin/python overnight.py 5000000 data/scale.db \
-      >> logs/overnight.log 2>&1 || true
+      >> logs/overnight.log 2>&1 & SPID=$!
+  wait "$SPID" 2>/dev/null || true
+  SPID=""
 
   # Reclaim the log while nothing holds a snapshot. This is the only moment in
   # the cycle when a checkpoint is guaranteed to succeed.
