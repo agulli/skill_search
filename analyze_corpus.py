@@ -29,9 +29,11 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -308,17 +310,55 @@ def main() -> int:
     counts = {BLOCK: 0, FLAG: 0, ALLOW: 0}
     escalated = audit_hits = 0
     t0 = time.perf_counter()
-    for i, r in enumerate(todo, 1):
-        v = verdicts[r["id"]]
-        a = None
-        if use_model:
-            try:
-                tools = json.loads(r["allowed_tools"] or "[]")
-            except Exception:
-                tools = []
-            a = analyze(r["name"] or "", r["description"] or "",
-                        r["body"] or "", tools,
-                        [f.as_dict() for f in v.findings])
+
+    # Sequential by default, and the reason is a measurement that did not
+    # survive being repeated in the right conditions.
+    #
+    # Where the time goes: one 8B Q4 analysis is 1.38s of prefill at 870 tok/s
+    # and 15.0s of decode at 33.9 tok/s — 72% of it decoding ~509 output
+    # tokens. Decode on Apple Silicon is memory-bandwidth-bound, so concurrent
+    # requests looked like the obvious win, and in isolation they were: two
+    # together took 24.9s against 36.8s sequentially, a clean 1.48x.
+    #
+    # In the pipeline, alongside the crawler that is the normal operating
+    # condition, it vanished. Two runs of eight skills: 133s then 152s with one
+    # worker, 148s then 142s with two — the ordering flipped, so the difference
+    # is noise. The idle-machine figure measured headroom that is not there
+    # when anything else is running, which is the same mistake as measuring
+    # precision on an attack-enriched sample.
+    #
+    # Left at one, because the cost of being wrong is not symmetric: each slot
+    # holds its own KV cache beside a 9.6 GB model on 24 GB of shared memory,
+    # and this pipeline has already been stalled once by pushing this machine
+    # into swap — where everything sat at 0% CPU and looked hung rather than
+    # slow. `SKILL_ENGINE_ANALYZER_WORKERS=2` is there for an otherwise idle
+    # machine, where the 1.48x is real.
+    #
+    # SQLite stays single-threaded either way: workers only call the model, and
+    # every `decide` and `UPDATE` happens here, in severity order, one at a
+    # time.
+    workers = max(1, int(os.getenv("SKILL_ENGINE_ANALYZER_WORKERS", "1")))
+
+    def analyse(row):
+        v = verdicts[row["id"]]
+        if not use_model:
+            return row, v, None
+        try:
+            tools = json.loads(row["allowed_tools"] or "[]")
+        except Exception:
+            tools = []
+        return row, v, analyze(row["name"] or "", row["description"] or "",
+                               row["body"] or "", tools,
+                               [f.as_dict() for f in v.findings])
+
+    if use_model and workers > 1:
+        pool = ThreadPoolExecutor(workers)
+        results = pool.map(analyse, todo)
+    else:
+        pool = None
+        results = (analyse(r) for r in todo)
+
+    for i, (r, v, a) in enumerate(results, 1):
         d = decide(v, a)
         counts[d.action] += 1
         if d.action == BLOCK and v.level != CRITICAL:
@@ -357,6 +397,9 @@ def main() -> int:
                      "[block %d flag %d allow %d]",
                      i, len(todo), per, (len(todo) - i) * per / 60,
                      counts[BLOCK], counts[FLAG], counts[ALLOW])
+
+    if pool is not None:
+        pool.shutdown(wait=True)
 
     # Everything the rules cleared and the model never saw is allowed at zero
     # confidence — recorded explicitly, so "not assessed" and "assessed clean"
