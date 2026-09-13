@@ -273,6 +273,18 @@ DECLARED_OFFENSIVE = _rx(
     # offensive-lateral-movement. The few that mean "offensive content" never
     # reach the dual-use path, which only opens on a block-worthy verdict.
     r"\boffensive\b|post[-\s]exploitation|exploit[-\s]+development",
+    # Disciplines the first version simply omitted, each a standard named
+    # branch of the field. Their absence blocked five copies of
+    # `linux-privilege-escalation` — an honestly-titled privesc guide whose
+    # instructed actions are `hostname`, `uname -a`, `cat /proc/version`.
+    #
+    # This vocabulary only ever *relaxes* a block to a flag, and never for a
+    # rule-critical skill, so a missing term costs recall nothing and an extra
+    # term costs at most a disclosure instead of a withholding.
+    r"privilege[-\s]escalation|privesc|lateral[-\s]movement",
+    r"container[-\s]escape|web[-\s]?shell|command[-\s]injection",
+    r"deserializ\w+|shellcode|payload[-\s]+development",
+    r"reverse[-\s]engineer\w*|binary[-\s]exploit\w*|fuzz\w*",
     r"living[- ]off[- ]the[- ]land|exfiltrat\w+",
 )
 

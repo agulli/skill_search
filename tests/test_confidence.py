@@ -241,11 +241,45 @@ def test_an_unambiguous_marker_blocks_whatever_the_skill_claims():
     assert d.action == BLOCK
 
 
-def test_a_declared_purpose_does_not_excuse_a_mismatch():
-    """The exemption is for tools that do what they say."""
-    d = decide(Verdicts.offensive(HIGH),
-               FakeAnalysis(harm="severe", mismatch=True))
-    assert d.action == BLOCK
+def test_a_declared_purpose_does_not_excuse_acting_against_the_operator():
+    """What replaced the `not mismatch` condition, and why it is stronger.
+
+    `purpose_mismatch` was the original boundary on this exemption, and it does
+    not work here: when the declared purpose *is* the dangerous capability
+    there is nothing for the instructions to exceed, so a mismatch finding is a
+    model error. It behaved like one — the same `hunt-rce` returned False on
+    the curated index and True across nine copies of the 4M corpus.
+
+    The finding set answers it properly. Offensive security tooling attacks a
+    target the operator chose; a malicious skill attacks the operator. Reading
+    credentials, contacting a drop site, concealing the work or hiding an
+    instruction are all the second thing, and no honest offensive tool needs
+    any of them — whatever it calls itself.
+    """
+    from skill_engine.confidence import OPERATOR_DIRECTED
+    from skill_engine.safety import Finding
+
+    def declared_with(*rules):
+        return Verdict(level=HIGH,
+                       findings=[Finding(r, 8.0, "") for r in rules],
+                       capabilities=["declared_offensive_purpose"])
+
+    # tradecraft: the subject matter of a pentest skill
+    tradecraft = declared_with("remote_code_execution", "bind_shell", "persistence")
+    assert decide(tradecraft, FakeAnalysis(harm="severe", mismatch=True)).action == FLAG
+
+    # every operator-directed finding must defeat the exemption on its own
+    for rule in sorted(OPERATOR_DIRECTED):
+        v = declared_with("remote_code_execution", rule)
+        assert decide(v, FakeAnalysis(harm="severe", mismatch=True)).action == BLOCK, rule
+
+
+def test_the_exemption_never_applies_without_a_declaration():
+    from skill_engine.safety import Finding
+    v = Verdict(level=HIGH,
+                findings=[Finding("remote_code_execution", 8.0, ""),
+                          Finding("persistence", 3.0, "")])
+    assert decide(v, FakeAnalysis(harm="severe", mismatch=True)).action == BLOCK
 
 
 def test_an_undeclared_skill_gets_no_exemption():

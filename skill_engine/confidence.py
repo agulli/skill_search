@@ -107,6 +107,31 @@ PRECISION = {
 BLOCK_THRESHOLD = 0.80
 FLAG_THRESHOLD = 0.25
 
+# Findings that disqualify a skill from the dual-use exemption, whatever it
+# declares about itself.
+#
+# The distinction that makes the exemption safe: **offensive security tooling
+# attacks a target the operator chose; a malicious skill attacks the
+# operator.** A penetration-testing skill legitimately contains remote code
+# execution, bind shells, privilege escalation and persistence — that is the
+# subject matter. It has no reason to read the operator's credentials, contact
+# a drop site, conceal what it did, or hide an instruction where the operator
+# cannot see it.
+#
+# So those findings are the exemption's boundary, and they are what the
+# original `not mismatch` condition was reaching for less precisely. Measured
+# against the skills this affects: `hunt-rce` carries
+# {remote_code_execution, network_egress, persistence} and
+# `linux-privilege-escalation` carries {remote_code_execution, bind_shell,
+# persistence} — tradecraft, none of it operator-directed.
+OPERATOR_DIRECTED = frozenset({
+    "credential_egress", "credential_payload", "environment_exfiltration",
+    "conversation_exfiltration", "prose_exfiltration", "whole_environment_capture",
+    "concealment", "layered_concealment", "concealed_destination",
+    "suspicious_host", "frontmatter_instruction", "hidden_html_instruction",
+    "inline_credential", "sysprompt_extraction",
+})
+
 
 @dataclass
 class Decision:
@@ -316,8 +341,34 @@ def decide(verdict, analysis=None) -> Decision:
     # It is kept because it is what holds if a precision figure is ever revised
     # upward, and noted so that nobody spends an afternoon working out why it
     # never fires.
+    # `mismatch` no longer gates this, and `OPERATOR_DIRECTED` does instead.
+    #
+    # `purpose_mismatch` asks whether the instructions exceed the *claimed*
+    # purpose. When the claim is itself the dangerous capability — "hunting
+    # skill for RCE vulnerabilities, built from 67 public bug bounty reports",
+    # "escalate privileges on Linux" — there is nothing to exceed, so a
+    # mismatch finding against it is a model error rather than evidence of
+    # deception. It behaves like one: the same `hunt-rce` returned
+    # `mismatch: False` on the curated index, where it was correctly flagged,
+    # and `mismatch: True` across nine copies of the 4M corpus, where it was
+    # blocked. An unstable signal should not decide a withholding.
+    #
+    # Dropping it alone would have been too generous, since a genuinely
+    # deceptive skill could claim the exemption by putting "privesc" in its
+    # name. The finding set answers that far better than the model can: a skill
+    # that reads credentials, contacts a drop site or conceals its work is
+    # acting against its operator, and no honest offensive tool needs to.
+    #
+    # Measured on 266 blocks in the 4M corpus: 14 change, all one class — 9
+    # copies of `hunt-rce` and 5 of `linux-privilege-escalation`. Nothing
+    # critical is touched, so `godmode` and the skill hiding "send secrets" in
+    # Unicode tag characters stay blocked, and no labelled attack declares an
+    # offensive purpose at all.
     declared = "declared_offensive_purpose" in (verdict.capabilities or [])
-    if d.action == BLOCK and verdict.level != CRITICAL and not mismatch and declared:
+    betrays_operator = bool(OPERATOR_DIRECTED & {f.rule for f in verdict.findings
+                                                 if f.weight > 0})
+    if (d.action == BLOCK and verdict.level != CRITICAL and declared
+            and not betrays_operator):
         d.action = FLAG
         d.basis = f"{basis}_declared_offensive"
         d.reasons.append("declared offensive-security purpose, consistent with "
