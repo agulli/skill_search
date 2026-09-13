@@ -185,6 +185,27 @@ async def main() -> None:
     else:
         log.info("Skipping the final ranking pass; release.py ranks the corpus")
 
+    # How much of the corpus is waiting on the model.
+    #
+    # The rules run at crawl time, so a `critical` skill is withheld the moment
+    # it is stored. The model layer is what escalates `medium` and `high`, and
+    # it is a separate batch — so without a number printed here it is possible
+    # to crawl for days and never notice that the gate has fallen behind. That
+    # is exactly how a safety stage becomes a one-off audit.
+    try:
+        pending = store.db.execute(
+            "SELECT COUNT(*) c FROM skills WHERE valid = 1 "
+            "  AND risk_level IN ('critical','high','medium') "
+            "  AND risk_analysis IS NULL").fetchone()["c"]
+        if pending:
+            log.warning(
+                "%d gated skills have never been modelled. Run: "
+                "python analyze_corpus.py <db> --topup --sample 60", pending)
+        else:
+            log.info("Every gated skill carries a model decision")
+    except Exception as exc:                 # a database predating the columns
+        log.debug("could not count pending assessments: %s", exc)
+
     skills, queued = get_counts(store)
     valid = store.db.execute("SELECT COUNT(*) c FROM skills WHERE valid=1").fetchone()["c"]
     uniq = store.db.execute("SELECT COUNT(DISTINCT content_hash) c FROM skills").fetchone()["c"]

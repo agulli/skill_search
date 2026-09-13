@@ -99,6 +99,26 @@ def main() -> int:
     blocked = store.db.execute(
         "SELECT COUNT(*) FROM skills WHERE risk_action = 'block'").fetchone()[0]
     print(f"    {blocked:,} skills blocked from search")
+
+    # Refuse to ship a corpus whose gated skills were never modelled.
+    #
+    # The rules alone leave a `high` at 0.55 confidence — flagged, not blocked —
+    # and it is the model that turns the genuinely harmful ones into blocks. A
+    # release built before that pass ran looks finished and quietly ships the
+    # difference, which is the failure this check exists to make impossible.
+    # `SKILL_ENGINE_ALLOW_UNASSESSED=1` is the deliberate override.
+    pending = store.db.execute(
+        "SELECT COUNT(*) FROM skills WHERE valid = 1 "
+        "  AND risk_level IN ('critical','high','medium') "
+        "  AND risk_analysis IS NULL").fetchone()[0]
+    if pending:
+        print(f"    {pending:,} gated skills have no model decision")
+        if os.getenv("SKILL_ENGINE_ALLOW_UNASSESSED", "") != "1":
+            raise SystemExit(
+                f"refusing to build: {pending:,} gated skills were never "
+                f"modelled.\n  Run: python analyze_corpus.py "
+                f"{src} --topup --sample 60\n"
+                f"  Or set SKILL_ENGINE_ALLOW_UNASSESSED=1 to ship anyway.")
     print(f"    Completed in {time.time()-t:.0f}s")
     t = log_step("Computing corpus-calibrated quality scores")
     result = recompute(store)

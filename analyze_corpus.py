@@ -275,6 +275,20 @@ def main() -> int:
     # decisions. A decision belongs to the content — which is already how the
     # override table is keyed — so one representative is modelled and the
     # result is written to every row sharing its hash.
+    # Severity first, not corpus order.
+    #
+    # At four million skills the gate selects around 40,000, which is well over
+    # a hundred hours of local inference — so the order in which they are
+    # modelled decides what is protected on day one rather than day five. A
+    # rule-critical skill is already withheld by the rules; a `high` is one
+    # model answer away from being withheld; a `medium` is the largest band and
+    # the least likely to move. Working in corpus order spends the first day on
+    # whatever happened to be crawled first.
+    #
+    # The run stays resumable either way, so an interrupted pass has decided
+    # the most consequential skills rather than an arbitrary prefix.
+    rank = {CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3, NONE: 4}
+    gated.sort(key=lambda r: rank.get(verdicts[r["id"]].level, 5))
     todo = gated + audit
     by_content: dict[str, list] = {}
     for r in todo:

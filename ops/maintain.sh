@@ -36,6 +36,10 @@ echo $$ > "$LOCK"
 cleanup() {
   [ -n "${DPID:-}" ] && kill "$DPID" 2>/dev/null
   [ -n "${SPID:-}" ] && kill "$SPID" 2>/dev/null
+  # The assessment child too. A stage added without a line here is a process
+  # that outlives its supervisor, which is how an orphaned crawler once held
+  # the queue for four and a half hours.
+  [ -n "${APID:-}" ] && kill "$APID" 2>/dev/null
   # Only remove the lock if it is still ours. An unconditional `rm` meant a
   # dying instance deleted the *live* instance's lockfile, after which a third
   # invocation saw no lock and started a second loop — two writers on one
@@ -99,6 +103,35 @@ while true; do
       >> logs/overnight.log 2>&1 & SPID=$!
   wait "$SPID" 2>/dev/null || true
   SPID=""
+
+  # Bring the model layer up to date with what the crawl just added.
+  #
+  # The rules run inside the crawler, so a `critical` skill is withheld the
+  # moment it is stored. Escalating `medium` and `high` needs the model, and
+  # that is a separate pass — left to be run by hand it drifts behind the crawl
+  # until the gate is a one-off audit with a date on it.
+  #
+  # `--topup` models only what the new rules or the new skills newly gated,
+  # which has been minutes rather than hours every time: 146, then 38, then 65.
+  # Bounded by a timeout so a wedged model server cannot stall the cycle, and
+  # skipped entirely if no model is reachable.
+  if curl -fsS --max-time 5 http://localhost:11434/api/tags >/dev/null 2>&1; then
+    .venv/bin/python analyze_corpus.py data/scale.db --topup --sample 60 \
+      >> logs/assess.log 2>&1 & APID=$!
+    for _ in $(seq 1 720); do
+      kill -0 "$APID" 2>/dev/null || break
+      sleep 5
+    done
+    if kill -0 "$APID" 2>/dev/null; then
+      echo "$(date +%F' '%H:%M) assessment exceeded an hour; killed" >> logs/maintain.log
+      kill -TERM "$APID" 2>/dev/null || true
+    fi
+    wait "$APID" 2>/dev/null || true
+    APID=""
+  else
+    echo "$(date +%F' '%H:%M) no local model reachable; assessment skipped" \
+      >> logs/maintain.log
+  fi
 
   # Reclaim the log while nothing holds a snapshot. This is the only moment in
   # the cycle when a checkpoint is guaranteed to succeed.
