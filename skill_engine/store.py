@@ -560,7 +560,7 @@ class Store:
 
     # --------------------------------------------------------------- skills
 
-    def _assess_full_body(self, rec: dict) -> Any:
+    def _assess_full_body(self, rec: dict, resource_text: str = "") -> Any:
         """Run the safety rules over the untruncated body.
 
         Imported lazily: the store is the lowest layer here and should not
@@ -601,7 +601,7 @@ class Store:
         try:
             v = inspect(rec.get("name") or "", rec.get("description") or "",
                         rec.get("body") or "", tools, rec.get("path") or "",
-                        rec.get("metadata") or "")
+                        rec.get("metadata") or "", resource_text)
         except Exception as exc:
             log.warning("assessment failed for %s/%s: %s",
                         rec.get("repo"), rec.get("path"), exc)
@@ -611,7 +611,7 @@ class Store:
         v.record_detail = v.as_json() if v.level != NONE else None
         return v
 
-    def upsert_skill(self, rec: dict) -> None:
+    def upsert_skill(self, rec: dict, resource_text: str = "") -> None:
         # Store at most CRAWL_BODY_CAP characters of body. At 2.47M skills the
         # crawl database reached 70.8GB — 28KB per skill, nearly all of it body
         # text — which made reaching 5M possible but building a release from it
@@ -630,7 +630,7 @@ class Store:
         verdict = None
         if rec.get("body") and ASSESS_ON_CRAWL:
             try:
-                verdict = self._assess_full_body(rec)
+                verdict = self._assess_full_body(rec, resource_text)
             except Exception as exc:
                 # Storing the skill matters more than assessing it on this
                 # pass. An unassessed row is picked up by the next batch, and

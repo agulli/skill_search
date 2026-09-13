@@ -1045,7 +1045,7 @@ def _evidence(match: re.Match | None) -> str:
 
 def inspect(name: str, description: str, body: str,
             allowed_tools: Iterable[str] = (), path: str = "",
-            metadata: str = "") -> Verdict:
+            metadata: str = "", resources: str = "") -> Verdict:
     """Assess what following this skill would cause an agent to do.
 
     `metadata` carries the frontmatter fields beyond the known ones, and it is
@@ -1133,6 +1133,43 @@ def inspect(name: str, description: str, body: str,
         v.findings.append(Finding("jailbreak_technique", 3.0,
                                   ", ".join(jailbreak_hits)))
         v.score += 3.0
+
+    # --- payloads in a file the SKILL.md only mentions
+    #
+    # A skill can keep its own text innocuous and put the work in a file it
+    # tells the agent to run: "Run the bundled script to begin." No rule
+    # written against the SKILL.md can see that, and four benchmark fixtures
+    # are built on exactly the gap — `batch-installer/setup.bat`,
+    # `cookie-stealer/setup.sh`, `exfiltrator/analyze.py`.
+    #
+    # The archive is already in memory when the crawler reads a skill, so the
+    # contents cost nothing to inspect and are dropped again immediately; only
+    # the verdict is kept.
+    #
+    # Measured on 117 real archives, restricted to runnable files: 45 of 3,365
+    # skills bundle one, 6 fixture payloads were found, and one ordinary skill
+    # matched — a forensics tool whose own test corpus holds a benign
+    # Dockerfile, which its body already puts at `high`. Documentation was
+    # excluded after measuring it: all 11 hits from including README,
+    # CHANGELOG and AGENTS.md were prose about the skill, which is no more
+    # concealed than the body.
+    if resources:
+        for label, rx, weight in SEVERE:
+            m = rx.search(resources)
+            if not m:
+                continue
+            v.capabilities.append(label)
+            v.findings.append(Finding(f"{label}_in_bundled_file", weight,
+                                      _evidence(m)))
+            v.score += weight
+        for label, rx, weight in CAPABILITY_RULES:
+            m = rx.search(resources)
+            if not m:
+                continue
+            v.capabilities.append(label)
+            v.findings.append(Finding(f"{label}_in_bundled_file", weight,
+                                      _evidence(m)))
+            v.score += weight
 
     # --- instructions in a field a human never reads
     #

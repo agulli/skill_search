@@ -203,13 +203,60 @@ class TarballFetcher:
         return bytes(buf)
 
 
-def extract_skills(blob: bytes, max_files: int = 5000) -> list[tuple[str, str]]:
+# Bundled files read alongside each skill, for safety inspection only.
+#
+# The archive is already in memory and already being iterated, so their
+# contents cost nothing extra to read — and they were being discarded. That
+# matters because a skill can keep its SKILL.md innocuous and put the payload
+# in a file it tells the agent to run: "Run the bundled script to begin."
+# Four benchmark fixtures do exactly that, and no rule written against the
+# SKILL.md alone can ever see them.
+#
+# Contents are inspected and dropped, never stored. The verdict is what the
+# corpus keeps.
+# Executables only. Measured on 117 real archives: of 432 skills that bundle
+# files, 11 had a bundled file matching a safety rule — and every one of those
+# 11 was *documentation*: README, CHANGELOG, CONTRIBUTING, CODE_OF_CONDUCT,
+# AGENTS.md, REFERENCE.md. Prose about a skill is no more concealed than its
+# body and is full of examples by nature, so including it buys false positives
+# and nothing else.
+#
+# Every fixture payload, by contrast, was in something runnable:
+# `batch-installer/setup.bat`, `cookie-stealer/setup.sh`,
+# `exfiltrator/analyze.py`, `external-script-fetch/run.sh`.
+#
+# Config files (`mcp.json`, `.claude/settings.json`) are a real vector too — a
+# bundled hook is code that runs every turn — but they need rules about hooks
+# and MCP servers rather than these shell-shaped ones, so they are left out
+# until those exist rather than scanned with the wrong patterns.
+RESOURCE_SUFFIXES = (".sh", ".bash", ".zsh", ".bat", ".cmd", ".ps1", ".psm1",
+                     ".py", ".js", ".mjs", ".cjs", ".ts", ".rb", ".pl", ".php",
+                     ".mk")
+RESOURCE_MAX_BYTES = 256 * 1024
+RESOURCE_MAX_PER_SKILL = 24
+
+
+def _is_resource(name: str) -> bool:
+    leaf = name.rsplit("/", 1)[-1].lower()
+    if leaf == "skill.md":
+        return False
+    return leaf.endswith(RESOURCE_SUFFIXES) or leaf in ("makefile", "dockerfile")
+
+
+def extract_skills(
+    blob: bytes, max_files: int = 5000, *, with_resources: bool = False
+) -> list[tuple[str, str]] | tuple[list[tuple[str, str]], dict[str, dict[str, str]]]:
     """Pull every SKILL.md out of an archive as (repo-relative path, text).
 
     Streams through the archive rather than extracting it: nothing is written to
     disk, so a hostile archive cannot escape a directory it was never given.
+
+    With `with_resources`, also returns the text of files bundled beside each
+    skill, keyed by the skill's directory. A single pass collects both, because
+    a `r|gz` stream cannot be rewound.
     """
     out: list[tuple[str, str]] = []
+    resources: dict[str, dict[str, str]] = {}
     try:
         tar = tarfile.open(fileobj=io.BytesIO(blob), mode="r|gz")
     except tarfile.TarError as exc:
@@ -221,18 +268,32 @@ def extract_skills(blob: bytes, max_files: int = 5000) -> list[tuple[str, str]]:
             if not member.isfile() or len(out) >= max_files:
                 continue
             name = member.name
-            if name.rsplit("/", 1)[-1].lower() != "skill.md":
+            # GitHub archives nest everything under "<repo>-<sha>/"; strip it
+            # so paths match what the tree API would have reported.
+            path = name.split("/", 1)[1] if "/" in name else name
+            leaf = name.rsplit("/", 1)[-1].lower()
+
+            if leaf == "skill.md":
+                if member.size > 512 * 1024:
+                    continue
+                handle = tar.extractfile(member)
+                if handle is None:
+                    continue
+                out.append((path, handle.read().decode("utf-8", "replace")))
                 continue
-            if member.size > 512 * 1024:
+
+            if not with_resources or not _is_resource(name):
+                continue
+            if member.size > RESOURCE_MAX_BYTES:
+                continue
+            directory = path.rsplit("/", 1)[0] if "/" in path else ""
+            bucket = resources.setdefault(directory, {})
+            if len(bucket) >= RESOURCE_MAX_PER_SKILL:
                 continue
             handle = tar.extractfile(member)
             if handle is None:
                 continue
-            raw = handle.read()
-            # GitHub archives nest everything under "<repo>-<sha>/"; strip it
-            # so paths match what the tree API would have reported.
-            path = name.split("/", 1)[1] if "/" in name else name
-            out.append((path, raw.decode("utf-8", "replace")))
+            bucket[path] = handle.read().decode("utf-8", "replace")
     except (tarfile.TarError, EOFError, OSError) as exc:
         # A truncated archive still yields whatever was read before the break.
         log.debug("archive read stopped early: %s", exc)
@@ -241,7 +302,7 @@ def extract_skills(blob: bytes, max_files: int = 5000) -> list[tuple[str, str]]:
             tar.close()
         except Exception:
             pass
-    return out
+    return (out, resources) if with_resources else out
 
 
 async def harvest_repo_tarball(
@@ -262,13 +323,18 @@ async def harvest_repo_tarball(
     if blob is None:
         return None
 
-    found = extract_skills(blob)
+    found, bundles = extract_skills(blob, with_resources=True)
     total = len(found)
     if total > cfg.max_skills_per_repo:
         found = found[: cfg.max_skills_per_repo]
 
     for path, text in found:
         parsed = parse_skill(text, path)
+        # Files bundled beside this skill, for inspection only. Capped and
+        # dropped after the verdict is taken; nothing here is stored.
+        directory = path.rsplit("/", 1)[0] if "/" in path else ""
+        bundle = bundles.get(directory) or {}
+        resource_text = "\n".join(bundle.values())[:RESOURCE_MAX_BYTES]
         store.upsert_skill({
             "repo": full_name,
             "path": path,
@@ -291,7 +357,7 @@ async def harvest_repo_tarball(
             "valid": int(parsed.valid),
             "invalid_reason": parsed.invalid_reason,
             "warnings": parsed.notes,
-        })
+        }, resource_text)
 
     store.mark_repo(full_name, tree_sha=f"tar:{len(blob)}", skill_count=total,
                     error=None)
