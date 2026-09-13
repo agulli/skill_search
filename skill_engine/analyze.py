@@ -64,6 +64,26 @@ DEFAULT_MODEL = os.getenv("SKILL_ENGINE_ANALYZER_MODEL", "gemma4")
 # the start — an attack at character 8,000 is invisible to a head-only window.
 EXCERPT = int(os.getenv("SKILL_ENGINE_ANALYZER_EXCERPT", "3500"))
 
+# A note on the obvious optimisation, so it is not rediscovered and adopted.
+#
+# 72% of an analysis is decoding ~509 output tokens, almost all of it
+# `claimed_purpose` and `instructed_actions`. Adding "be terse — at most 4
+# actions, each under 80 characters" to the instructions cuts that to ~100
+# tokens and roughly 2.5x the throughput. Measured on three skills.
+#
+# It also changes the model's *judgements*. On the same three: one flipped
+# `harm_if_followed` from `none` to `severe`, another flipped
+# `addresses_reviewer` from False to True. Those are two of the three fields
+# `confidence.py` actually decides on, and every figure in its PRECISION table
+# — including the 0/149 clean-skill baseline that lets an unprimed harm act at
+# all — was measured against the prompt as it stands here.
+#
+# So the speedup is available, and it costs a re-measurement: the 39-case
+# labelled set, plus 149 randomly sampled rule-clean skills to re-establish the
+# false-positive rates. Roughly three hours of inference to save several days.
+# Worth doing deliberately; not worth slipping in, because the result would be
+# the same pipeline reporting numbers that no longer describe it.
+
 # Deliberately not derived from the skill text. Anything a skill can influence
 # is something an attacker can influence.
 SYSTEM = """You are a security reviewer examining an AI agent skill — a
