@@ -116,7 +116,12 @@ while true; do
   # Bounded by a timeout so a wedged model server cannot stall the cycle, and
   # skipped entirely if no model is reachable.
   if curl -fsS --max-time 5 http://localhost:11434/api/tags >/dev/null 2>&1; then
-    .venv/bin/python analyze_corpus.py data/scale.db --topup --sample 60 \
+    # `--pending`, not `--topup`: the latter re-runs the rules over the whole
+    # corpus to find what new rules newly gated, which is eleven minutes at
+    # 95,725 skills and about eight hours at four million. Routine work reads
+    # the verdict the crawler already recorded. Run `--topup` by hand after
+    # changing a rule.
+    .venv/bin/python analyze_corpus.py data/scale.db --pending \
       >> logs/assess.log 2>&1 & APID=$!
     for _ in $(seq 1 720); do
       kill -0 "$APID" 2>/dev/null || break

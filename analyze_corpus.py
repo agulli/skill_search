@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import random
+import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -50,6 +51,125 @@ log = logging.getLogger("analyze")
 GATED_LEVELS = (CRITICAL, HIGH, MEDIUM)
 
 
+
+
+def model_pending(store: Store, args) -> int:
+    """Model the skills the crawler has already flagged, and nothing else.
+
+    Every other mode begins by running the rules over the whole corpus. At
+    95,725 skills that is eleven minutes; at 4.19 million it is about eight
+    hours, which makes a loop impossible and a continuous verification pass
+    with it.
+
+    It is also now redundant. The crawler assesses each skill as it is stored,
+    on the untruncated body, and records the verdict — so the gated set is a
+    column to read rather than a corpus to rescan. `risk_level` defaults to
+    'none', so only an assessment can have written one of the gated levels; a
+    skill that has not been crawled yet reads 'none' and is correctly left for
+    its own re-crawl.
+
+    The verdict is recomputed for the selected rows, not reconstructed from
+    `risk_detail`, so the decision always reflects the rules as they are now.
+    That costs about 7 ms each over a few thousand rows, against eight hours to
+    reach them the other way.
+    """
+    # Without this the selection scans 4.19M rows on every iteration of a loop.
+    try:
+        store.db.execute("PRAGMA busy_timeout = 120000")
+        store.db.execute("CREATE INDEX IF NOT EXISTS skills_risk_pending "
+                         "ON skills(risk_level, risk_analysis)")
+        store.commit()
+    except sqlite3.OperationalError as exc:
+        log.warning("could not create the pending index (%s); "
+                    "selection will be slower", exc)
+
+    rank = {CRITICAL: 0, HIGH: 1, MEDIUM: 2}
+    rows = store.db.execute(
+        "SELECT id, name, repo, description, body, allowed_tools, path, "
+        "       metadata, content_hash, risk_level "
+        "FROM skills WHERE valid = 1 "
+        "  AND risk_level IN ('critical','high','medium') "
+        "  AND risk_analysis IS NULL").fetchall()
+    if not rows:
+        log.info("nothing pending: every flagged skill carries a decision")
+        store.close()
+        return 0
+
+    # Severity first, and deduplicated by content, exactly as the full pass
+    # does — an interrupted loop should have decided the worst, not a prefix.
+    rows.sort(key=lambda r: rank.get(r["risk_level"], 3))
+    seen: set[str] = set()
+    todo = []
+    for r in rows:
+        key = r["content_hash"] or f"id:{r['id']}"
+        if key in seen:
+            continue
+        seen.add(key)
+        todo.append(r)
+    if args.limit:
+        todo = todo[:args.limit]
+    log.info("%d flagged skills await a decision (%d distinct contents); "
+             "modelling %d", len(rows), len(seen), len(todo))
+
+    use_model = not args.no_model and available()
+    counts = {BLOCK: 0, FLAG: 0, ALLOW: 0}
+    escalated = 0
+    t0 = time.perf_counter()
+    for i, r in enumerate(todo, 1):
+        try:
+            tools = json.loads(r["allowed_tools"] or "[]")
+        except Exception:
+            tools = []
+        v = inspect(r["name"] or "", r["description"] or "", r["body"] or "",
+                    tools, r["path"] or "", _row_metadata(r))
+        a = None
+        if use_model:
+            a = analyze(r["name"] or "", r["description"] or "",
+                        r["body"] or "", tools,
+                        [f.as_dict() for f in v.findings])
+        d = decide(v, a)
+        counts[d.action] += 1
+        if d.action == BLOCK and v.level != CRITICAL:
+            escalated += 1
+            log.info("escalated to block: %s@%s — %s",
+                     r["name"], r["repo"], explain(d))
+        write_decision(store, r, v, d, a)
+        if i % 25 == 0 or i == len(todo):
+            per = (time.perf_counter() - t0) / i
+            log.info("  %d/%d  %.0fs each  eta %.0f min  "
+                     "[block %d flag %d allow %d]", i, len(todo), per,
+                     (len(todo) - i) * per / 60,
+                     counts[BLOCK], counts[FLAG], counts[ALLOW])
+
+    restored = overrides.apply_all(store)
+    print(f"\n  blocked {counts[BLOCK]}   flagged {counts[FLAG]}   "
+          f"allowed {counts[ALLOW]}")
+    if escalated:
+        print(f"  {escalated} of those blocks came from the model")
+    if restored:
+        print(f"  re-applied {restored} human override(s)")
+    store.close()
+    return 0
+
+
+def write_decision(store: Store, row, verdict, decision, analysis) -> None:
+    """Record one decision against every copy of the same content."""
+    payload = (verdict.level, decision.confidence, decision.action,
+               verdict.as_json() if verdict.level != NONE else None,
+               json.dumps({**decision.as_dict(),
+                           "analysis": analysis.as_dict() if analysis else None}))
+    if row["content_hash"]:
+        store.db.execute(
+            "UPDATE skills SET risk_level = ?, risk_confidence = ?, "
+            "risk_action = ?, risk_detail = ?, risk_analysis = ? "
+            "WHERE content_hash = ?", (*payload, row["content_hash"]))
+    else:
+        store.db.execute(
+            "UPDATE skills SET risk_level = ?, risk_confidence = ?, "
+            "risk_action = ?, risk_detail = ?, risk_analysis = ? "
+            "WHERE id = ?", (*payload, row["id"]))
+    # Committed per row: an interrupted pass must not start over.
+    store.commit()
 
 
 def redecide(store: Store) -> int:
@@ -139,6 +259,11 @@ def main() -> int:
                     help="also model N randomly chosen *unflagged* skills, to "
                          "estimate what the rule gate misses")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--pending", action="store_true",
+                    help="model only the skills the crawler already flagged, "
+                         "read from the stored verdict instead of re-running "
+                         "the rules over the corpus; the only mode that is "
+                         "cheap enough to run in a loop")
     ap.add_argument("--topup", action="store_true",
                     help="clear the recorded decision for any skill the *current* "
                          "rules gate but which was never modelled, so a resumed "
@@ -161,6 +286,9 @@ def main() -> int:
 
     if args.redecide:
         return redecide(store)
+
+    if args.pending:
+        return model_pending(store, args)
 
     if args.topup:
         # Adding a rule re-gates the corpus, and the rows it newly flags are
