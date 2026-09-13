@@ -191,6 +191,23 @@ INDEXES = (
 # change that decision without recrawling.
 CRAWL_BODY_CAP = int(os.getenv("SKILL_ENGINE_CRAWL_BODY_CAP", "4000"))
 
+# A skill the rules flag keeps its whole body regardless of the cap, and is
+# assessed *before* any truncation happens.
+#
+# The ordering is the point. Truncating first and assessing later means the
+# safety rules examine a different document from the one that was published,
+# and the discarded remainder is gone for good — a payload at character 8,000
+# would be permanently invisible, not merely unread. `release.py` has the same
+# hazard and solves it by inheriting decisions made upstream; this is upstream.
+#
+# Keeping the flagged bodies whole is what makes the cap affordable. The rules
+# gate about 1% of the corpus, so at four million skills this is roughly 40,000
+# full bodies — under a gigabyte — against the 20 GB the capped remainder
+# costs. The model layer and `review_blocks.py show` both need the real text:
+# an excerpt centred on a finding cannot be reconstructed from a head-truncated
+# body, and a reviewer cannot judge a block from the first 4,000 characters.
+ASSESS_ON_CRAWL = os.getenv("SKILL_ENGINE_ASSESS_ON_CRAWL", "1") != "0"
+
 
 class Store:
     def __init__(self, path: Path | str, *, read_only: bool = False) -> None:
@@ -307,6 +324,14 @@ class Store:
                 # as before rather than treating silence as suspicion.
                 "risk_level": "TEXT DEFAULT 'none'",
                 "risk_detail": "TEXT",
+                # The fused decision. Migrated here rather than added on demand
+                # by whichever tool needs them first, so that `upsert_skill`
+                # can retire a decision the moment an edit invalidates it —
+                # which it can only do inside the ON CONFLICT clause, where the
+                # old and new content hashes are both in scope.
+                "risk_confidence": "REAL",
+                "risk_action": "TEXT",
+                "risk_analysis": "TEXT",
             },
             "repos": {
                 "discovered_via": "TEXT", "owner_type": "TEXT", "homepage": "TEXT",
@@ -535,19 +560,87 @@ class Store:
 
     # --------------------------------------------------------------- skills
 
+    def _assess_full_body(self, rec: dict) -> Any:
+        """Run the safety rules over the untruncated body.
+
+        Imported lazily: the store is the lowest layer here and should not
+        require the rule engine to be importable in order to open a database.
+        A failure to assess never blocks a write — the skill is stored
+        unassessed and the next batch pass will pick it up, which is a better
+        outcome than losing the row.
+        """
+        try:
+            from .safety import CRITICAL, HIGH, MEDIUM, NONE, inspect
+        except Exception:            # pragma: no cover - safety always imports
+            return None
+
+        # Run unconditionally. A pre-filter was the obvious optimisation and it
+        # does not work here, measured three ways on 3,000 real skills with a
+        # mean body of 8.3 KB:
+        #
+        #   full inspect                     6.91 ms
+        #   one combined 42-pattern regex    7.04 ms
+        #   Rust gate, whole batch           1.31 ms
+        #   Rust gate, one row at a time     7.84 ms
+        #
+        # The cost *is* the matching — Python cannot scan 8 KB against these
+        # patterns faster than the rules already do, and the Rust gate's FFI
+        # overhead exceeds its own saving when handed a single row. The batch
+        # figure is the one worth having, and it is unavailable here because
+        # truncation is a per-row decision.
+        #
+        # It does not need to be faster. At 7 ms this thread sustains ~140
+        # skills/sec, and the crawler produces about 9 — fifteen times the
+        # headroom, against a crawl that is network-bound for 175 hours at four
+        # million skills. Roughly 8 hours of CPU spread across that, to avoid
+        # permanently discarding the text the gate is meant to read.
+        try:
+            tools = json.loads(rec.get("allowed_tools") or "[]")
+        except Exception:
+            tools = []
+        try:
+            v = inspect(rec.get("name") or "", rec.get("description") or "",
+                        rec.get("body") or "", tools, rec.get("path") or "",
+                        rec.get("metadata") or "")
+        except Exception as exc:
+            log.warning("assessment failed for %s/%s: %s",
+                        rec.get("repo"), rec.get("path"), exc)
+            return None
+        v.gated = v.level in (CRITICAL, HIGH, MEDIUM)
+        v.record_level = v.level
+        v.record_detail = v.as_json() if v.level != NONE else None
+        return v
+
     def upsert_skill(self, rec: dict) -> None:
         # Store at most CRAWL_BODY_CAP characters of body. At 2.47M skills the
         # crawl database reached 70.8GB — 28KB per skill, nearly all of it body
         # text — which made reaching 5M possible but building a release from it
         # impossible: that needs a snapshot plus a compacted copy, about 258GB.
         #
-        # Nothing is lost that the shipped index keeps: release.py already
-        # truncates to 2,000 characters, and doing so measured *better* on every
-        # retrieval metric, because truncation removes spurious matches deep in
-        # long documents. `content_hash` and `body_len` arrive already computed
-        # from the full text, so deduplication and the recorded true length are
-        # both unaffected.
-        if CRAWL_BODY_CAP and rec.get("body") and len(rec["body"]) > CRAWL_BODY_CAP:
+        # Nothing is lost that the shipped index keeps *for retrieval*:
+        # release.py already truncates to 2,000 characters, and doing so
+        # measured better on every retrieval metric, because truncation removes
+        # spurious matches deep in long documents. `content_hash` and
+        # `body_len` arrive already computed from the full text, so
+        # deduplication and the recorded true length are unaffected.
+        #
+        # Safety is the exception, and the reason the assessment below runs
+        # first: retrieval can afford to forget the tail of a document, and a
+        # gate cannot.
+        verdict = None
+        if rec.get("body") and ASSESS_ON_CRAWL:
+            try:
+                verdict = self._assess_full_body(rec)
+            except Exception as exc:
+                # Storing the skill matters more than assessing it on this
+                # pass. An unassessed row is picked up by the next batch, and
+                # `release.py` refuses to ship gated skills that were never
+                # modelled — whereas a lost row is lost.
+                log.warning("crawl-time assessment failed for %s/%s: %s",
+                            rec.get("repo"), rec.get("path"), exc)
+        if (CRAWL_BODY_CAP and rec.get("body")
+                and len(rec["body"]) > CRAWL_BODY_CAP
+                and not (verdict is not None and verdict.gated)):
             rec = {**rec, "body": rec["body"][:CRAWL_BODY_CAP]}
         self.db.execute(
             """
@@ -567,10 +660,42 @@ class Store:
                 blob_sha=excluded.blob_sha, content_hash=excluded.content_hash,
                 body_len=excluded.body_len, score=excluded.score, valid=excluded.valid,
                 invalid_reason=excluded.invalid_reason, warnings=excluded.warnings,
-                last_seen=excluded.last_seen
+                last_seen=excluded.last_seen,
+                -- A changed body is a different document, and the decision
+                -- recorded for the old one says nothing about it. Without this,
+                -- a skill that passed review and was later edited to add a
+                -- payload would keep its `allow`. Cleared here because this is
+                -- the only place the previous content hash is still in scope.
+                risk_confidence = CASE WHEN skills.content_hash = excluded.content_hash
+                    THEN skills.risk_confidence ELSE NULL END,
+                risk_action = CASE WHEN skills.content_hash = excluded.content_hash
+                    THEN skills.risk_action ELSE NULL END,
+                risk_analysis = CASE WHEN skills.content_hash = excluded.content_hash
+                    THEN skills.risk_analysis ELSE NULL END
             """,
             {"warnings": "", **rec, "now": time.time()},
         )
+        if verdict is not None:
+            self._record_verdict(rec, verdict)
+
+    def _record_verdict(self, rec: dict, verdict: Any) -> None:
+        """Store the rule verdict computed from the untruncated body.
+
+        The fused decision is retired by the upsert's own ON CONFLICT clause
+        rather than here, because that is the only place the *previous* content
+        hash is still in scope. `overrides` are keyed on content hash for the
+        same reason and need no such handling: a human decision about text
+        still applies to that text, and stops applying to a replacement nobody
+        reviewed.
+        """
+        try:
+            self.db.execute(
+                "UPDATE skills SET risk_level = ?, risk_detail = ? "
+                "WHERE repo = ? AND path = ?",
+                (verdict.record_level, verdict.record_detail,
+                 rec.get("repo"), rec.get("path")))
+        except sqlite3.OperationalError:      # pragma: no cover
+            pass
 
     def touch_skill(self, repo: str, path: str) -> None:
         """Record that an unchanged skill is still present, without a refetch."""

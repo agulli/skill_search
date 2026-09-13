@@ -108,8 +108,12 @@ def test_a_rules_only_index_still_excludes_critical(tmp_path):
     st.db.execute("UPDATE skills SET risk_level = 'critical' "
                   "WHERE name = 'key-stealer'")
     st.commit()
-    cols = {r["name"] for r in st.db.execute("PRAGMA table_info(skills)")}
-    assert "risk_action" not in cols, "this test covers the pre-action index"
+    # `risk_action` is part of the base schema now, so the older generation has
+    # to be reconstructed rather than assumed: a column that is present and
+    # entirely NULL is exactly the state that used to be mistaken for "no
+    # decisions have been made".
+    st.db.execute("UPDATE skills SET risk_action = NULL, risk_confidence = NULL")
+    st.commit()
 
     found = names(search(st, "rotate signing keys"))
     assert "key-rotation" in found and "key-stealer" not in found

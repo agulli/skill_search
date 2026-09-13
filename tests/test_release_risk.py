@@ -100,7 +100,6 @@ def test_a_decision_is_not_recomputed_from_truncated_text(db):
     """`skip_assessed` is what keeps a deep payload's verdict intact."""
     st = Store(db)
     assess_corpus(st)
-    st.db.execute("ALTER TABLE skills ADD COLUMN risk_confidence REAL")
     st.db.execute("UPDATE skills SET risk_confidence = 0.86 "
                   "WHERE risk_level = 'critical'")
     st.db.execute("UPDATE skills SET risk_confidence = 0.0 "

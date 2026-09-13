@@ -227,12 +227,18 @@ def test_critical_skills_are_withheld_from_search(tmp_path):
         })
     db.commit()
 
-    assert len(search(db, "pdf tables", limit=5)) == 2   # before assessment
-    counts = assess_corpus(db)["counts"]
-    assert counts.get(CRITICAL) == 1
-
+    # Withheld from the moment it was stored. `upsert_skill` assesses the
+    # untruncated body before writing, so there is no window in which a
+    # malicious skill is served pending a later batch pass — which is the
+    # property that makes the crawler's body cap safe to keep.
     names = [h.name for h in search(db, "pdf tables", limit=5)]
     assert names == ["pdf-extract"], "a critical skill must not be returned"
+
+    # And the batch pass agrees with what the crawler recorded.
+    counts = assess_corpus(db)["counts"]
+    assert counts.get(CRITICAL) == 1
+    names = [h.name for h in search(db, "pdf tables", limit=5)]
+    assert names == ["pdf-extract"]
 
     # Auditable: the exclusion can be inspected, not just trusted.
     unsafe = search(db, "pdf tables", limit=5, filters={"include_unsafe": True})
@@ -495,8 +501,6 @@ def test_search_withholds_model_escalated_blocks(tmp_path):
             "invalid_reason": "", "warnings": "",
         })
     db.commit()
-    for col, decl in (("risk_confidence", "REAL"), ("risk_action", "TEXT")):
-        db.db.execute(f"ALTER TABLE skills ADD COLUMN {col} {decl}")
     # Rules said only "high"; the model escalated it to a block.
     db.db.execute("UPDATE skills SET risk_level='high', risk_action='block', "
                   "risk_confidence=0.92 WHERE path='esc.md'")

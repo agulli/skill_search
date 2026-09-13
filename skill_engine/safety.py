@@ -1480,6 +1480,39 @@ def _row_metadata(row: Any) -> str:
     return "" if value in (None, "{}", "null") else str(value)
 
 
+_MATCHER: Any = None
+_MATCHER_TRIED = False
+
+
+def _gate_matcher() -> Any:
+    """The compiled gate, built once.
+
+    Compiling 42 patterns into a `RegexSet` is the expensive part of this gate,
+    and it was being done on every call. Over a 2,000-row batch that is
+    invisible; called once per skill from the crawler it dominated everything,
+    turning a 7 ms assessment into 24 ms — the pre-filter cost three times what
+    it saved. The batch path pays it 48 times over the corpus for no reason
+    either.
+    """
+    global _MATCHER, _MATCHER_TRIED
+    if _MATCHER_TRIED:
+        return _MATCHER
+    _MATCHER_TRIED = True
+    if _rs is None:
+        return None
+    patterns = _gate_patterns()
+    if patterns is None:
+        return None
+    try:
+        _MATCHER = _rs.Matcher(patterns)
+    except ValueError as exc:
+        # Any pattern the accelerator cannot compile falls back rather than
+        # silently narrowing what gets inspected.
+        log.warning("gate unavailable (%s); running the unaccelerated path", exc)
+        _MATCHER = None
+    return _MATCHER
+
+
 def _needs_inspection(rows: list[Any]) -> list[int] | None:
     """Indices worth inspecting in full, or None if no accelerator is present.
 
@@ -1488,17 +1521,8 @@ def _needs_inspection(rows: list[Any]) -> list[int] | None:
     against 187/sec for the Python equivalent. The saving is not the matching
     itself but the 99.4% of documents that never reach it.
     """
-    if _rs is None:
-        return None
-    patterns = _gate_patterns()
-    if patterns is None:
-        return None
-    try:
-        matcher = _rs.Matcher(patterns)
-    except ValueError as exc:
-        # Any pattern the accelerator cannot compile falls back rather than
-        # silently narrowing what gets inspected.
-        log.warning("gate unavailable (%s); running the unaccelerated path", exc)
+    matcher = _gate_matcher()
+    if matcher is None:
         return None
     # Must cover exactly what `inspect` examines, metadata included: a field
     # the gate does not read is a field the rules never see.

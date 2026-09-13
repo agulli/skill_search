@@ -175,11 +175,23 @@ def _where(filters: dict[str, Any]) -> tuple[str, list[Any]]:
     # reintroduce one. `include_unsafe` exists for auditing the exclusions.
     if filters.get("_has_risk") and not filters.get("include_unsafe"):
         if filters.get("_has_action"):
-            # The fused decision is authoritative: it is the only thing that
-            # accounts for the model escalating a skill the rules rated merely
-            # suspicious. Filtering on `risk_level` alone would let those
-            # through.
-            clauses.append("COALESCE(s.risk_action, 'allow') != 'block'")
+            # Per row, not per schema. This used to branch on whether the
+            # `risk_action` column existed, treating its presence as a proxy
+            # for "a decision has been made" — and the proxy broke the moment
+            # the column became part of the base schema, because a rules-only
+            # index then had the column present and every value NULL, which
+            # coalesced to `allow` and served critical skills.
+            #
+            # The distinction that actually matters is whether *this row* has a
+            # decision. Where one exists it is authoritative, since it is the
+            # only thing that accounts for the model escalating a skill the
+            # rules rated merely suspicious, and the only thing a human
+            # override can speak through. Where none exists the rule verdict
+            # stands in.
+            clauses.append(
+                "CASE WHEN s.risk_action IS NOT NULL "
+                "  THEN s.risk_action != 'block' "
+                "  ELSE COALESCE(s.risk_level, 'none') != 'critical' END")
         else:
             clauses.append("COALESCE(s.risk_level, 'none') != 'critical'")
     if filters.get("min_stars"):
