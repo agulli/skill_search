@@ -227,3 +227,70 @@ def inspect_level(body, name="batch-installer",
                   desc="Installs the Windows helper the skill needs."):
     from skill_engine.safety import inspect
     return inspect(name, desc, body, [], "skills/x/SKILL.md").level
+
+
+# ------------------------------- a fusion pass must not re-judge partial text
+
+
+def test_redecide_keeps_the_verdict_when_the_body_is_truncated(st, tmp_path):
+    """The bug this exists to prevent, which cost 824 rows in one run.
+
+    `--redecide` re-runs the fusion layer, and re-derived the rule verdict as a
+    convenience so a decision would reflect the current rules. For a skill
+    whose stored body is a 4,000-character prefix — 93.7% of the 4M corpus
+    until its repository is re-crawled — that read a different document from
+    the one the decision was about.
+
+    It downgraded 824 rows to `allow`, every one of the 400 checked with a
+    truncated body, including nine copies of a skill hiding "send secrets" in
+    Unicode tag characters *past the cut*. The decision had been made correctly
+    on a full copy and propagated by content hash, then re-derived from a
+    prefix that no longer held the evidence.
+    """
+    import json as _json
+    import subprocess
+    import sys as _sys
+
+    from skill_engine import overrides
+
+    db = tmp_path / "trunc.db"
+    s2 = Store(db)
+    s2.db.execute("INSERT INTO repos(full_name,owner,name) VALUES('a/b','a','b')")
+    overrides.ensure(s2)
+
+    # A row whose stored body is a prefix: the evidence sat past the cut, and
+    # the verdict on record was reached from the whole document.
+    prefix = "Formatting guidance. " * 100
+    s2.upsert_skill({
+        "repo": "a/b", "path": "p.md", "name": "helper",
+        "description": "Formats prose.", "body": prefix, "heading": "",
+        "version": None, "license": "MIT", "allowed_tools": "[]",
+        "metadata": "{}", "resources": "[]", "source_kind": "root",
+        "blob_sha": "", "content_hash": "shared", "body_len": 40_000,
+        "score": 0.0, "valid": 1, "invalid_reason": "", "warnings": "",
+    })
+    s2.db.execute(
+        "UPDATE skills SET risk_level='critical', risk_action='block', "
+        "risk_confidence=0.86, risk_detail=?, risk_analysis=? WHERE path='p.md'",
+        (_json.dumps({"level": "critical", "score": 10.0, "capabilities": [],
+                      "findings": [{"rule": "hidden_unicode_payload",
+                                    "weight": 10.0,
+                                    "evidence": "12 tag chars: 'send secrets'"}]}),
+         _json.dumps({"action": "block", "confidence": 0.86,
+                      "basis": "rule_critical_alone", "reasons": [],
+                      "analysis": None})))
+    s2.commit(); s2.close()
+
+    out = subprocess.run([_sys.executable, "analyze_corpus.py", str(db),
+                          "--redecide"], cwd=ROOT, capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+
+    s3 = Store(db)
+    row = s3.db.execute("SELECT risk_action, risk_level, risk_detail "
+                        "FROM skills WHERE path='p.md'").fetchone()
+    assert row["risk_action"] == "block", \
+        "a truncated body must not be re-judged into an allow"
+    assert row["risk_level"] == "critical"
+    assert "send secrets" in (row["risk_detail"] or ""), \
+        "the recorded evidence must survive a fusion pass"
+    s3.close()

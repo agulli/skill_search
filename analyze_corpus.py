@@ -185,50 +185,126 @@ def redecide(store: Store) -> int:
     match the code that produced the levels), but no model call is made.
     """
     rows = store.db.execute(
-        "SELECT id, name, repo, description, body, allowed_tools, path, "
-        "       metadata, risk_analysis FROM skills "
+        "SELECT id, name, repo, description, body, body_len, allowed_tools, "
+        "       path, metadata, content_hash, risk_level, risk_detail, "
+        "       risk_analysis FROM skills "
         "WHERE risk_analysis IS NOT NULL").fetchall()
-    log.info("re-deciding %d stored analyses; no model calls", len(rows))
 
-    changed = counts = 0
+    changed = counts = partial = 0
     moved: dict[tuple[str, str], int] = {}
+
+    # Grouped by content, and the representative is the copy with the most
+    # text. A decision belongs to the content — that is how `--pending` and the
+    # override table are both keyed — and copies of one skill do not all have
+    # the same stored body: whichever repository has been re-crawled holds the
+    # whole thing, the rest still hold a 4,000-character prefix. Judging each
+    # row against its own prefix is what downgraded 824 of them.
+    groups: dict[str, list] = {}
     for r in rows:
-        stored = json.loads(r["risk_analysis"] or "{}")
+        groups.setdefault(r["content_hash"] or f"id:{r['id']}", []).append(r)
+    log.info("re-deciding %d stored analyses across %d distinct contents; "
+             "no model calls", len(rows), len(groups))
+
+    for key, members in groups.items():
+        best = max(members, key=lambda m: len(m["body"] or ""))
+        stored = json.loads(best["risk_analysis"] or "{}")
         before = stored.get("action")
         raw = stored.get("analysis") or {}
 
-        try:
-            tools = json.loads(r["allowed_tools"] or "[]")
-        except Exception:
-            tools = []
-        v = inspect(r["name"] or "", r["description"] or "",
-                    r["body"] or "", tools, r["path"] or "",
-                    _row_metadata(r))
+        body = best["body"] or ""
+        complete = len(body) >= (best["body_len"] or len(body))
+        if complete:
+            try:
+                tools = json.loads(best["allowed_tools"] or "[]")
+            except Exception:
+                tools = []
+            v = inspect(best["name"] or "", best["description"] or "", body,
+                        tools, best["path"] or "", _row_metadata(best))
+        else:
+            # Nothing here holds the whole document, so the verdict already
+            # recorded is the best evidence available. Reconstructed rather
+            # than recomputed: a rule that matched past the cut would vanish.
+            v = StoredVerdict(best["risk_level"], best["risk_detail"])
+            partial += 1
 
         a = StoredAnalysis(raw) if raw.get("ok") else None
         d = decide(v, a)
-        counts += 1
+        counts += len(members)
         if d.action != before:
-            changed += 1
-            moved[(before or "?", d.action)] = moved.get((before or "?", d.action), 0) + 1
-            log.info("  %s -> %s  %s@%s — %s",
-                     before, d.action, r["name"], r["repo"], explain(d))
-        store.db.execute(
-            "UPDATE skills SET risk_level = ?, risk_confidence = ?, "
-            "risk_action = ?, risk_detail = ?, risk_analysis = ? WHERE id = ?",
-            (v.level, d.confidence, d.action,
-             v.as_json() if v.level != NONE else None,
-             json.dumps({**d.as_dict(), "analysis": raw or None}), r["id"]))
+            changed += len(members)
+            moved[(before or "?", d.action)] = \
+                moved.get((before or "?", d.action), 0) + len(members)
+            log.info("  %s -> %s  %s@%s (%d cop%s) — %s", before, d.action,
+                     best["name"], best["repo"], len(members),
+                     "y" if len(members) == 1 else "ies", explain(d))
+
+        payload = (v.level, d.confidence, d.action,
+                   v.as_json() if v.level != NONE else None,
+                   json.dumps({**d.as_dict(), "analysis": raw or None}))
+        if best["content_hash"]:
+            store.db.execute(
+                "UPDATE skills SET risk_level = ?, risk_confidence = ?, "
+                "risk_action = ?, risk_detail = ?, risk_analysis = ? "
+                "WHERE content_hash = ?", (*payload, best["content_hash"]))
+        else:
+            store.db.execute(
+                "UPDATE skills SET risk_level = ?, risk_confidence = ?, "
+                "risk_action = ?, risk_detail = ?, risk_analysis = ? "
+                "WHERE id = ?", (*payload, best["id"]))
     store.commit()
 
     restored = overrides.apply_all(store)
     print(f"\n  re-decided {counts}; {changed} changed")
+    if partial:
+        print(f"    {partial} had a truncated body and kept their recorded "
+              f"verdict; only the fusion was re-run")
     for (before, after), n in sorted(moved.items()):
         print(f"    {before} -> {after}: {n}")
     if restored:
         print(f"  re-applied {restored} human override(s)")
     store.close()
     return 0
+
+
+class StoredVerdict:
+    """The rule verdict already recorded, for a row whose body is truncated.
+
+    Shaped like `Verdict` for `decide`. Reconstructed rather than recomputed
+    because recomputing would read a prefix of the document the verdict
+    describes — and a rule that matched past the cut would simply vanish.
+    """
+
+    def __init__(self, level: str, detail: str | None):
+        self.level = level or NONE
+        parsed = {}
+        if detail:
+            try:
+                parsed = json.loads(detail) or {}
+            except (json.JSONDecodeError, TypeError):
+                parsed = {}
+        self.score = parsed.get("score", 0.0)
+        self.capabilities = list(parsed.get("capabilities") or [])
+        self.findings = [StoredFinding(f) for f in (parsed.get("findings") or [])]
+
+    def as_json(self) -> str:
+        return json.dumps({
+            "level": self.level, "score": self.score,
+            "capabilities": sorted(self.capabilities),
+            "findings": [f.as_dict() for f in self.findings[:12]],
+        })
+
+
+class StoredFinding:
+    """One recorded finding, with the fields `decide` and `as_json` read."""
+
+    def __init__(self, raw: dict):
+        self.rule = raw.get("rule") or ""
+        self.weight = raw.get("weight") or 0.0
+        self.evidence = raw.get("evidence") or ""
+
+    def as_dict(self) -> dict:
+        return {"rule": self.rule, "weight": self.weight,
+                "evidence": self.evidence}
 
 
 class StoredAnalysis:
