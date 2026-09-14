@@ -688,12 +688,39 @@ class Store:
         still applies to that text, and stops applying to a replacement nobody
         reviewed.
         """
+        # A changed verdict invalidates the decision built on the old one.
+        #
+        # The upsert above retires a decision when the *content* changes. This
+        # is the other way a decision goes stale: the content is identical and
+        # the verdict moves anyway, because the rules have changed since. A
+        # skill drawn into an audit sample while rule-clean is modelled, found
+        # harmless and recorded `allow` at 0.0 confidence — and a later rule
+        # addition raises it to `high`, leaving a row that reads
+        # `risk_level = high, risk_action = allow`.
+        #
+        # That row is then invisible to every repair. `--pending` skips it
+        # because it already carries an analysis, so it sits at `allow` with a
+        # gated verdict beside it: no demotion, no disclosure. Twenty such rows
+        # existed in the 4M corpus before this, found only because a
+        # level-versus-action tally produced a combination the fusion layer
+        # cannot generate.
+        #
+        # `risk_level` on the right-hand side is the pre-update value, so this
+        # clears the decision exactly when the level moves.
         try:
             self.db.execute(
-                "UPDATE skills SET risk_level = ?, risk_detail = ? "
+                "UPDATE skills SET risk_detail = ?, "
+                "  risk_confidence = CASE WHEN risk_level IS ? "
+                "    THEN risk_confidence ELSE NULL END, "
+                "  risk_action = CASE WHEN risk_level IS ? "
+                "    THEN risk_action ELSE NULL END, "
+                "  risk_analysis = CASE WHEN risk_level IS ? "
+                "    THEN risk_analysis ELSE NULL END, "
+                "  risk_level = ? "
                 "WHERE repo = ? AND path = ?",
-                (verdict.record_level, verdict.record_detail,
-                 rec.get("repo"), rec.get("path")))
+                (verdict.record_detail, verdict.record_level,
+                 verdict.record_level, verdict.record_level,
+                 verdict.record_level, rec.get("repo"), rec.get("path")))
         except sqlite3.OperationalError:      # pragma: no cover
             pass
 
