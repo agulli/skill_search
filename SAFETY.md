@@ -765,3 +765,32 @@ tuned to a benchmark it can be shown to be mismeasuring.
 The semantic tail needs an instrument that reads intent. That is the model
 layer, which by design only sees what the rules gate. Widening what is *gated*
 is affordable; widening what is *blocked* is not.
+
+### The part that is provably undetectable
+
+Of the missed fixtures declaring one of the four common document-skill names,
+**28 of 30 are byte-identical to a legitimate skill already in this corpus**:
+
+    case_0020_v3_dim7_xlsx_revenue_manipulation
+      == registries/memoh/packages/xlsx/skills/xlsx/SKILL.md   (similarity 1.000)
+    case_0028_v3_dim10_docx_fake_cve
+      == registries/memoh/packages/docx/skills/docx/SKILL.md    (similarity 1.000)
+
+Median similarity 1.000, median diff 0 characters. Their SKILL.md carries no
+payload whatsoever; the harmful behaviour lives entirely outside the text a
+static gate reads.
+
+This closes the question rather than deferring it. No text-based rule can flag
+these, and no rule *should*: the text is a published, legitimate skill, so any
+rule matching it would remove the real `xlsx` skill from the index along with
+the fixture. A benchmark that labels identical bytes both malicious and benign
+sets a recall ceiling that is a property of the labels, not of the gate.
+
+This also kills the near-duplicate-diff idea that the 97.8% figure suggested —
+there is no diff to inspect.
+
+The consequence is a change of posture, not of thresholds. Recall asks "what
+fraction of bad skills do the rules catch?", and for this family the answer
+cannot exceed zero. Coverage asks "what fraction of *served* skills were
+individually reviewed?", which is answerable, and which a smaller index makes
+affordable.
