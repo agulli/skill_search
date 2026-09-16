@@ -93,3 +93,44 @@ def test_clopper_pearson_bound_with_no_findings():
         upper = 1 - 0.05 ** (1 / n)
         assert upper == pytest.approx(expect, rel=0.05)
         assert upper > 0
+
+
+def test_audit_writes_cannot_newly_serve_a_withheld_skill():
+    """The audit writes decisions to the live corpus, so it must not un-block.
+
+    Before a decision exists, search falls back to `risk_level != 'critical'`,
+    which withholds a critical skill. Once `risk_action` is written it becomes
+    authoritative. So if a benign model opinion could ever carry a critical
+    verdict to `allow`, running an audit would silently serve skills that were
+    being withheld — the write turning a safe default into an unsafe one.
+
+    It cannot, because the model escalates and never exonerates. Pinned here
+    because the failure would be silent and would look like an improvement.
+    """
+    sys.path.insert(0, str(ROOT))
+    from skill_engine.analyze import Analysis
+    from skill_engine.confidence import decide
+    from skill_engine.safety import (CRITICAL, HIGH, MEDIUM, NONE, Finding,
+                                     Verdict)
+
+    benign = Analysis(ok=True, claimed_purpose="formats tables",
+                      framing="clear", purpose_mismatch=False,
+                      addresses_reviewer=False, harm_if_followed="none",
+                      reasoning="an ordinary utility")
+    verdicts = [
+        (CRITICAL, Verdict(level=CRITICAL, score=13.0, capabilities=["concealment"],
+                           findings=[Finding("instruction_override", 10.0, "x")])),
+        (HIGH, Verdict(level=HIGH, score=8.0, capabilities=["concealment"],
+                       findings=[Finding("instruction_secrecy", 8.0, "x")])),
+        (MEDIUM, Verdict(level=MEDIUM, score=4.0, capabilities=[],
+                         findings=[Finding("split_path_literal", 4.0, "x")])),
+        (NONE, Verdict(level=NONE, score=0.0, findings=[], capabilities=[])),
+    ]
+    for level, v in verdicts:
+        for analysis in (benign, None):
+            action = decide(v, analysis).action
+            served_before = level != CRITICAL   # the risk_action IS NULL fallback
+            served_after = action != "block"
+            assert not (served_after and not served_before), (
+                f"a {level} verdict with model={analysis is not None} became "
+                f"{action}, which would newly serve a withheld skill")
