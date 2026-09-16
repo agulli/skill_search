@@ -177,6 +177,13 @@ def audit_index(store: Store, args) -> int:
     confidence", and that bound is what a claim about the index rests on.
     """
     floor = args.score_floor
+    # The continuous verifier holds write locks on the same corpus. Without a
+    # timeout the first collision throws away a model call that has already
+    # been paid for.
+    try:
+        store.db.execute("PRAGMA busy_timeout = 300000")
+    except sqlite3.OperationalError as exc:
+        log.warning("could not set a busy timeout (%s)", exc)
     log.info("selecting the curated tier (score >= %d)…", floor)
     rows = store.db.execute(
         "SELECT id, name, repo, description, body, allowed_tools, path, "
@@ -229,7 +236,20 @@ def audit_index(store: Store, args) -> int:
             harmful.append((r["name"], r["repo"], v.level, d.action, explain(d)))
             log.info("audit finding: %s@%s — rules said %s, decision %s — %s",
                      r["name"], r["repo"], v.level, d.action, explain(d))
-        write_decision(store, r, v, d, a)
+        # A lost write costs a 20-second model call, so retry rather than
+        # abort; the measurement survives a contended corpus either way,
+        # because the verdict is already counted above.
+        for attempt in range(4):
+            try:
+                write_decision(store, r, v, d, a)
+                break
+            except sqlite3.OperationalError as exc:
+                if attempt == 3:
+                    log.warning("could not record %s@%s (%s); the audit "
+                                "counts it but the corpus will not",
+                                r["name"], r["repo"], exc)
+                else:
+                    time.sleep(2 * (attempt + 1))
         if i % 10 == 0 or i == len(todo):
             per = (time.perf_counter() - t0) / i
             log.info("  %d/%d  %.0fs each  eta %.1f h  [flagged %d]",
