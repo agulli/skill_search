@@ -794,3 +794,72 @@ fraction of bad skills do the rules catch?", and for this family the answer
 cannot exceed zero. Coverage asks "what fraction of *served* skills were
 individually reviewed?", which is answerable, and which a smaller index makes
 affordable.
+
+## Curation: what a smaller index can and cannot do
+
+The obvious response to a 68% recall ceiling is to stop trying to police four
+million skills and serve a smaller, better one instead. That works, but not
+for the reason it first appears to.
+
+**Provenance does not predict malice.** Measured across 4,031,878 valid skills
+against the 2,156 benchmark fixtures:
+
+| signal                | attacks | ordinary |
+|-----------------------|--------:|---------:|
+| quality score under 40|   98.4% |    98.5% |
+| repo under 3 stars    |   82.8% |    79.4% |
+| repo under 10 stars   |   91.0% |    90.3% |
+| in a fork             |    0.0% |     0.0% |
+| archived repo         |    0.0% |     0.9% |
+
+Stars and quality score have no discriminative power whatever — the attack and
+ordinary distributions are the same to within a percentage point. A quality
+floor is not a security filter, and anyone reading one as a trust signal is
+reading noise. (The first attempt at this table was circular: attacks were
+defined as `/malicious/` paths and the filter under test excluded
+`/malicious/` paths, reporting a tautological 100% exclusion. Nothing keyed on
+the path can be evaluated against a label that *is* the path.)
+
+**Deduplication does, and it is the one real win.** Keeping the
+highest-provenance copy of each content hash — tiebreak on stars and quality
+only, never on the path — excludes **65.8%** of the attack copies: 737 of
+2,156 survive as the chosen representative. This is not a detection result. An
+attack copy loses precisely when identical text exists in a better-starred
+repo, which is exactly the byte-identical family described above. The gate
+never recognises those fixtures; the index simply never picks them.
+
+**What curation actually buys is coverage.** The corpus is steeply skewed, so
+a quality floor collapses it:
+
+| score floor | skills    | distinct contents | 1 worker | 2 workers |
+|------------:|----------:|------------------:|---------:|----------:|
+|           0 | 4,031,878 |         2,298,335 |  12,130h |    8,196h |
+|          40 |    61,872 |            51,775 |     273h |      185h |
+|          60 |    39,847 |            36,415 |     192h |      130h |
+|          70 |    20,773 |            19,779 |     104h |       71h |
+
+At the full corpus, individually reviewing every skill is four hundred days of
+inference and therefore not a plan. At score>=70 it is days. That changes the
+guarantee on offer from "the rules catch some fraction of attacks" — which for
+the byte-identical family cannot exceed zero — to "every served skill was
+individually reviewed", which is checkable and does not depend on a rule
+anticipating an attack.
+
+Coverage at score>=40 when this was written: 131 of 51,775 distinct contents
+(0.3%). The work is the point; the reframing only makes it finite.
+
+**The measurement that was missing.** Until `--audit`, every mode selected
+skills the rules had already flagged, so the model was only ever asked to
+confirm a finding. That can measure precision and can never measure a false
+negative: confirming the rules' findings cannot discover what the rules never
+found. `--audit` samples the curated tier at random regardless of verdict,
+which also makes the judgement unprimed — `build_prompt` names the flagged
+patterns, so agreement on a gated skill is weak evidence, while with no
+findings to name a harm verdict is the model's own.
+
+It reports a Clopper-Pearson upper bound rather than a point estimate. Zero
+findings in 800 draws does not mean zero contamination; it supports "at most
+0.37%, with 95% confidence". Any claim about the index should quote the bound,
+and should not be confused with a recall figure — a clean audit of a curated
+tier says nothing about the 68%, which is capped by labels that call identical
+bytes both malicious and benign.
