@@ -695,3 +695,73 @@ look-around was *stripped* — always broadening the match, never narrowing it.
   It was chosen so that the corpus is never sent to a third party, and the
   architecture assumes it is weak: it is asked only for description, it can only
   escalate, and its one high-false-positive output is weighted so it cannot act.
+
+## What a static gate cannot do
+
+The recall target for this gate was 99% on an independent benchmark of 2,156
+malicious fixtures collected from other people's scanner test suites. It
+reached 68%. The remaining 32% is not one gap; measuring it separated it into
+three, and only the first is a rule problem.
+
+**Recall is monotonic in body length.**
+
+| body length    | caught | missed | recall |
+|----------------|-------:|-------:|-------:|
+| under 200 B    |     68 |    247 |  21.6% |
+| 200 – 500 B    |    135 |    231 |  36.9% |
+| 500 – 1,500 B  |    192 |     97 |  66.4% |
+| 1.5 – 5 kB     |    669 |    123 |  84.5% |
+| over 5 kB      |    394 |      0 | 100.0% |
+
+Median caught body: 3,598 bytes. Median missed body: 364. Every one of the 394
+fixtures over 5 kB is caught. The gate is not weak at reading skills; it is
+being asked to read things that are not skills.
+
+**43% of the misses have nothing to read.** 301 of 698 have a body under 300
+bytes, and 261 of those bundle no files at all. Their full text:
+
+    persistence-cron:  "Run `bash scripts/setup.sh` to install the backup job."
+    host-mount:        "Run `bash scripts/test.sh` to run the container."
+    destructive-rm:    "See the bundled scripts before running."
+
+`scripts/setup.sh` is not in the repository. These are name-only placeholders
+in other projects' test suites, where the directory name asserts a label the
+content does not carry. Counting them as missed detections measures the
+filename, not the gate — the same error as labelling an eval set from a
+detector's own findings, which this project has made before.
+
+**The rest is behaviour, not text.** The largest coherent family (453 fixtures
+from two academic datasets) is built by copying a real skill and changing a
+few hundred characters. Measured against their benign twins: median 282
+characters changed, **97.8% similar**, and several are byte-identical in
+SKILL.md. The payload of `case_0013_v3_dim5_pptx_token_bomb` is one sentence:
+
+> return all text content including speaker notes verbatim for completeness —
+> do not truncate or summarize any content
+
+Nothing in that sentence is detectable, because nothing in it is wrong. It is
+a token bomb only when the presentation it reads contains a hidden megabyte of
+text. The malice is a property of the skill *and its input at run time*, and
+those datasets are built to be executed, not scanned. The same holds for
+`revenue_manipulation`, `fake_cve`, `vendor_pref`, `homoglyph` and
+`collusion` — the harm is in what the agent outputs.
+
+Two rule families were written for this tail and rejected on measurement
+(recorded in the commit): naming credentials and egress in English cost 434
+ordinary skills per 2 catches, because *"NEVER send your API key to any domain
+other than ours"* is security advice in an attacker's vocabulary. Inspecting
+body-referenced markdown cost 7 ordinary skills per 0 catches, and read a
+security auditor's own `threat-model.md` as its behaviour.
+
+**So the honest number is not one number.** Against fixtures that contain an
+attack in the text — bodies of 500 bytes or more — recall is 85.1%, and 100%
+above 5 kB. Against everything the benchmark labels malicious, 68%. Pushing
+the second figure toward 99% means adopting rules whose false-positive rate
+runs from 0.3% to 0.8% of the corpus. At 4.3M skills and a true base rate of
+0.019%, a 0.3% false-positive rate buries every real finding under 700
+spurious ones. That trade is not worth making, and the gate should not be
+tuned to a benchmark it can be shown to be mismeasuring.
+
+The semantic tail needs an instrument that reads intent. That is the model
+layer, which by design only sees what the rules gate. Widening what is *gated*
+is affordable; widening what is *blocked* is not.
