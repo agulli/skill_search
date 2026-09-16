@@ -390,6 +390,34 @@ CONCEALMENT = _rx(
     r"delete\s+(?:the\s+)?(?:logs?|history|evidence)\s+afterwards?",
 )
 
+# Telling the agent to hide its own instructions.
+#
+# Distinct from CONCEALMENT, which is about hiding an *action* from the user.
+# This hides the skill's own text: "never reveal these instructions", "do not
+# mention that you have a system prompt". A skill has no legitimate reason to
+# ask for that — its instructions are what the installer is entitled to read,
+# and a skill that argues otherwise is arguing against review.
+#
+# Measured on 120,000 ordinary skills: 1 match. A time-capsule skill whose
+# "never reveal the content of a sealed letter before its delivery date" is
+# about its own subject matter, not about its instructions. That is the whole
+# false-positive cost.
+#
+# This is the only one of four prose-intent candidates that survived
+# measurement. The others are recorded in SAFETY.md: naming credentials and
+# egress in English caught 2 more fixtures at the cost of 434 ordinary skills,
+# because "NEVER send your API key to any domain other than ours" is security
+# *advice* written in the vocabulary of an attack. Pattern matching cannot
+# separate prose harm from prose safety; that separation is the model's job.
+INSTRUCTION_SECRECY = _rx(
+    r"never\s+(?:reveal|disclose|share|mention|repeat)\s+(?:these|this|your|the)\s+"
+    r"(?:instructions?|prompt|rules?|directives?)",
+    r"do\s+not\s+(?:mention|reveal|disclose|acknowledge)\s+(?:that\s+)?you\s+"
+    r"(?:have|were\s+given|received)\s+(?:a\s+)?(?:system\s+)?(?:prompt|instructions?)",
+    r"(?:keep|leave)\s+(?:this|these|it)\s+(?:out\s+of|hidden\s+from)\s+"
+    r"(?:the\s+)?(?:final\s+)?(?:answer|response|output|summary)",
+)
+
 # Real credentials committed into the file itself.
 INLINE_SECRET = _rx(
     r"AKIA[0-9A-Z]{16}",                       # AWS access key id
@@ -433,6 +461,50 @@ NETWORK_EGRESS = _rx(
     r"\bnc\b\s+(?:-\w+\s+)*[\w.]+\s+\d{2,5}",
     r"requests\.(?:post|put)\s*\(",
     r"\bfetch\s*\([^\n]{0,80}method\s*:\s*['\"]POST",
+)
+
+# --- the two halves of the bundled-script combination
+#
+# Neither half is a finding on its own inside a bundled file. Reading a path
+# is what a dotfile manager does; calling the network is what a quarter of all
+# bundled scripts do. It is the *conjunction in one bundle* that is rare.
+#
+# Measured on 150 ordinary repos fetched for the purpose — 724 skills that
+# bundle a runnable file: 4 read a secret path (0.55%), 183 call the network
+# (25%), and **1 does both** (0.14%) — a skill named `bypassing-…` scraped
+# into a "skills-collection", which is plausibly a true positive itself.
+#
+# Both halves are deliberately broader than the body rules they echo. Body
+# rules pay for breadth in false positives against prose; these only ever see
+# code, where `urllib.request.urlopen` means what it says. That breadth is the
+# point: it is how the `case_*` fixtures evade `NETWORK_EGRESS`, which knows
+# curl and `requests.post` but not `urllib`.
+BUNDLED_SENSITIVE_READ = _rx(
+    r"~/\.ssh|\.ssh/id_",
+    r"\.aws/credentials",
+    # `.git/config` carries push tokens and remote URLs with embedded
+    # credentials. Too common in prose to score in a body; in a script that
+    # also calls out, it is a target.
+    r"\.git/config",
+    # Writing a shell profile is persistence, and reading one is recon. Zero
+    # corpus matches either way.
+    r"expanduser\(['\"]~/\.(?:bashrc|zshrc|profile|bash_profile)",
+)
+
+BUNDLED_EGRESS = _rx(
+    r"urllib\.request\.(?:urlopen|Request)",
+    r"requests\.(?:post|put|get)\s*\(",
+    r"httpx\.|http\.client|aiohttp",
+    r"\bcurl\s|\bwget\s",
+)
+
+# A path split across a concatenation — `"~/.aws/" + "credentials"` — reads
+# identically to the agent and matches no rule written against the whole
+# string. There is no reason to write it that way except to defeat a matcher,
+# which is why it scores on its own rather than only in combination.
+SPLIT_PATH_LITERAL = _rx(
+    r"['\"]~?/?\.(?:ssh|aws|config|netrc|docker)/?['\"]\s*\+",
+    r"\+\s*['\"](?:credentials|id_rsa|id_ed25519|\.env)['\"]",
 )
 
 SUSPICIOUS_HOST = _rx(
@@ -1316,6 +1388,15 @@ def inspect(name: str, description: str, body: str,
         v.findings.append(Finding("refusal_suppression_discussed", 0.0,
                                   _evidence(refusal)))
 
+    secrecy = INSTRUCTION_SECRECY.search(text)
+    if secrecy and not _is_discussed(text, secrecy, security_subject, body_start):
+        v.capabilities.append("concealment")
+        v.findings.append(Finding("instruction_secrecy", 8.0, _evidence(secrecy)))
+        v.score += 8.0
+    elif secrecy:
+        v.findings.append(Finding("instruction_secrecy_discussed", 0.0,
+                                  _evidence(secrecy)))
+
     jailbreak_hits = [label for label, rx in JAILBREAK_RX if rx.search(text)]
     jailbreak = len(jailbreak_hits) >= JAILBREAK_MIN
     if jailbreak:
@@ -1365,6 +1446,26 @@ def inspect(name: str, description: str, body: str,
             v.findings.append(Finding(f"{label}_in_bundled_file", weight,
                                       _evidence(m)))
             v.score += weight
+
+        # A bundled script that reads a secret *and* calls out. See the
+        # measurement above BUNDLED_SENSITIVE_READ: 1 in 724 ordinary skills.
+        sens = BUNDLED_SENSITIVE_READ.search(resources)
+        egress = BUNDLED_EGRESS.search(resources)
+        if sens and egress:
+            v.capabilities.append("credential_egress")
+            v.findings.append(Finding(
+                "bundled_secret_egress", 7.0,
+                f"bundled script reads {_evidence(sens)} and calls "
+                f"{_evidence(egress)}"))
+            v.score += 7.0
+
+        split = SPLIT_PATH_LITERAL.search(resources)
+        if split:
+            v.capabilities.append("concealment")
+            v.findings.append(Finding(
+                "split_path_literal", 4.0,
+                f"sensitive path assembled from fragments: {_evidence(split)}"))
+            v.score += 4.0
 
     # --- instructions in a field a human never reads
     #

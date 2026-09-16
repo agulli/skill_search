@@ -257,6 +257,7 @@ def extract_skills(
     """
     out: list[tuple[str, str]] = []
     resources: dict[str, dict[str, str]] = {}
+    flat: dict[str, str] = {}
     try:
         tar = tarfile.open(fileobj=io.BytesIO(blob), mode="r|gz")
     except tarfile.TarError as exc:
@@ -286,14 +287,13 @@ def extract_skills(
                 continue
             if member.size > RESOURCE_MAX_BYTES:
                 continue
-            directory = path.rsplit("/", 1)[0] if "/" in path else ""
-            bucket = resources.setdefault(directory, {})
-            if len(bucket) >= RESOURCE_MAX_PER_SKILL:
-                continue
             handle = tar.extractfile(member)
             if handle is None:
                 continue
-            bucket[path] = handle.read().decode("utf-8", "replace")
+            # Collected flat and associated after the pass: which skill owns a
+            # file depends on every skill directory in the archive, and not all
+            # of them have been seen yet.
+            flat[path] = handle.read().decode("utf-8", "replace")
     except (tarfile.TarError, EOFError, OSError) as exc:
         # A truncated archive still yields whatever was read before the break.
         log.debug("archive read stopped early: %s", exc)
@@ -302,7 +302,31 @@ def extract_skills(
             tar.close()
         except Exception:
             pass
-    return (out, resources) if with_resources else out
+    if not with_resources:
+        return out
+
+    # Matched by directory *prefix*, not by immediate directory.
+    #
+    # Keying on the immediate directory associated a skill only with files
+    # sitting literally beside its SKILL.md — and almost nothing does. Helpers
+    # live in `scripts/`, data in `config/`, media in `assets/`, so a skill's
+    # own `scripts/generate_report.py` was filed under `<skill>/scripts` and
+    # never seen by the skill at all. Resource inspection was therefore working
+    # for the minority case only: 507 resource directories in one benchmark
+    # repository yielded an empty bundle for every skill in it.
+    dirs = sorted({p.rsplit("/", 1)[0] if "/" in p else "" for p, _ in out},
+                  key=len, reverse=True)
+    for rpath, text in flat.items():
+        # Deepest matching skill directory wins, so a nested skill claims its
+        # own files rather than its parent claiming them.
+        for directory in dirs:
+            prefix = f"{directory}/" if directory else ""
+            if rpath.startswith(prefix):
+                bucket = resources.setdefault(directory, {})
+                if len(bucket) < RESOURCE_MAX_PER_SKILL:
+                    bucket[rpath] = text
+                break
+    return out, resources
 
 
 async def harvest_repo_tarball(
