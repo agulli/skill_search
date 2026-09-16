@@ -36,6 +36,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -148,6 +149,112 @@ def model_pending(store: Store, args) -> int:
         print(f"  {escalated} of those blocks came from the model")
     if restored:
         print(f"  re-applied {restored} human override(s)")
+    store.close()
+    return 0
+
+
+def audit_index(store: Store, args) -> int:
+    """Model a random sample of the *curated index*, flagged or not.
+
+    Every other mode looks only at skills the rules already flagged, which
+    can measure precision and can never measure a false negative: asking the
+    model to confirm the rules' findings cannot discover what the rules never
+    found. This samples the served tier at random instead, so a skill reaches
+    the model precisely because it was selected — not because something was
+    suspicious about it.
+
+    That makes the model's judgement here unprimed. `build_prompt` names the
+    flagged patterns, so agreement on a gated skill is weak evidence; with no
+    findings to name, a harm verdict is the model's own.
+
+    The sample is drawn over distinct content hashes, because the model judges
+    text and identical text is one judgement. Decisions are written, so the
+    pass builds real coverage as well as measuring it, and is resumable —
+    re-running skips what already carries an analysis.
+
+    Reports a Clopper-Pearson upper bound, not a point estimate. With zero
+    findings in n draws the honest statement is "at most p% with 95%
+    confidence", and that bound is what a claim about the index rests on.
+    """
+    floor = args.score_floor
+    log.info("selecting the curated tier (score >= %d)…", floor)
+    rows = store.db.execute(
+        "SELECT id, name, repo, description, body, allowed_tools, path, "
+        "       metadata, content_hash, risk_level, risk_analysis, score "
+        "FROM skills WHERE valid = 1 AND score >= ?", (floor,)).fetchall()
+
+    # One row per distinct content, preferring one that is not yet decided so
+    # a resumed run spends the model on new text.
+    by_hash: dict[str, Any] = {}
+    for r in rows:
+        key = r["content_hash"] or f"id:{r['id']}"
+        cur = by_hash.get(key)
+        if cur is None or (cur["risk_analysis"] and not r["risk_analysis"]):
+            by_hash[key] = r
+    pool = list(by_hash.values())
+    undecided = [r for r in pool if not r["risk_analysis"]]
+    log.info("%d skills, %d distinct contents, %d without a model decision",
+             len(rows), len(pool), len(undecided))
+
+    rng = random.Random(args.seed)
+    rng.shuffle(undecided)
+    todo = undecided[:args.audit] if args.audit > 0 else undecided
+    if not todo:
+        print("  every distinct content in this tier already carries a decision")
+        store.close()
+        return 0
+
+    use_model = not args.no_model and available()
+    if not use_model:
+        print("  no model available; an audit without one measures nothing",
+              file=sys.stderr)
+        store.close()
+        return 1
+
+    counts = {BLOCK: 0, FLAG: 0, ALLOW: 0}
+    harmful = []
+    t0 = time.perf_counter()
+    for i, r in enumerate(todo, 1):
+        try:
+            tools = json.loads(r["allowed_tools"] or "[]")
+        except Exception:
+            tools = []
+        v = inspect(r["name"] or "", r["description"] or "", r["body"] or "",
+                    tools, r["path"] or "", _row_metadata(r))
+        a = analyze(r["name"] or "", r["description"] or "", r["body"] or "",
+                    tools, [f.as_dict() for f in v.findings])
+        d = decide(v, a)
+        counts[d.action] += 1
+        if d.action != ALLOW:
+            harmful.append((r["name"], r["repo"], v.level, d.action, explain(d)))
+            log.info("audit finding: %s@%s — rules said %s, decision %s — %s",
+                     r["name"], r["repo"], v.level, d.action, explain(d))
+        write_decision(store, r, v, d, a)
+        if i % 10 == 0 or i == len(todo):
+            per = (time.perf_counter() - t0) / i
+            log.info("  %d/%d  %.0fs each  eta %.1f h  [flagged %d]",
+                     i, len(todo), per, (len(todo) - i) * per / 3600,
+                     len(harmful))
+
+    n = len(todo)
+    k = len(harmful)
+    # Clopper-Pearson upper bound at 95%. With k=0 it reduces to 1-0.05**(1/n).
+    try:
+        from scipy.stats import beta  # type: ignore
+        upper = 1.0 if k == n else beta.ppf(0.975, k + 1, n - k)
+    except Exception:
+        upper = 1 - 0.05 ** (1 / n) if k == 0 else None
+
+    overrides.apply_all(store)
+    print(f"\n  audited {n} distinct contents from the score>={floor} tier")
+    print(f"  block {counts[BLOCK]}   flag {counts[FLAG]}   allow {counts[ALLOW]}")
+    if upper is not None:
+        print(f"  contamination: {k}/{n} = {100*k/n:.2f}%   "
+              f"95% upper bound {100*upper:.2f}%")
+        print(f"  => this tier is at least {100*(1-upper):.2f}% clean, "
+              f"with 95% confidence")
+    for name, repo, lvl, act, why in harmful[:25]:
+        print(f"    {act:<6} {lvl:<8} {name}@{repo} — {why}")
     store.close()
     return 0
 
@@ -347,6 +454,16 @@ def main() -> int:
     ap.add_argument("--redecide", action="store_true",
                     help="re-run only the fusion layer, from the model output "
                          "already stored; makes no model calls")
+    ap.add_argument("--audit", type=int, default=-1, metavar="N",
+                    help="model N randomly chosen skills from the curated tier "
+                         "regardless of whether the rules flagged them, to "
+                         "measure false negatives and report a confidence "
+                         "bound on how clean the tier is; --audit 0 audits "
+                         "the tier exhaustively")
+    ap.add_argument("--score-floor", type=int, default=70,
+                    help="quality floor defining the curated tier for --audit")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="sampling seed, so an audit can be reproduced")
     ap.add_argument("--resume", action="store_true", default=True)
     args = ap.parse_args()
 
@@ -360,6 +477,8 @@ def main() -> int:
     store = Store(path)
     overrides.ensure(store)
 
+    if args.audit >= 0:
+        return audit_index(store, args)
     if args.redecide:
         return redecide(store)
 
