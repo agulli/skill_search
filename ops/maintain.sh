@@ -115,7 +115,20 @@ while true; do
   # which has been minutes rather than hours every time: 146, then 38, then 65.
   # Bounded by a timeout so a wedged model server cannot stall the cycle, and
   # skipped entirely if no model is reachable.
-  if curl -fsS --max-time 5 http://localhost:11434/api/tags >/dev/null 2>&1; then
+  # Yield to the dedicated verifier if one is running.
+  #
+  # ops/verify.sh holds logs/verify.pid for exactly this reason, and its own
+  # comment says why: "Two would model the same skills concurrently and waste
+  # the scarcest resource here, which is inference." This stage predates that
+  # loop and was bypassing its lock, so both supervisors were working the same
+  # pending set and redoing each other's rows. Measured while it was happening:
+  # four model consumers on one Ollama server put a single judgement at 76
+  # seconds against a 19-second baseline.
+  if [ -f logs/verify.pid ] && \
+     kill -0 "$(cat logs/verify.pid 2>/dev/null)" 2>/dev/null; then
+    echo "$(date +%F' '%H:%M) a verifier holds the lock; assessment skipped" \
+      >> logs/maintain.log
+  elif curl -fsS --max-time 5 http://localhost:11434/api/tags >/dev/null 2>&1; then
     # `--pending`, not `--topup`: the latter re-runs the rules over the whole
     # corpus to find what new rules newly gated, which is eleven minutes at
     # 95,725 skills and about eight hours at four million. Routine work reads
