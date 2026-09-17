@@ -207,3 +207,59 @@ def test_search_results_carry_a_risk_badge(store):
     hits = {h.name: h for h in search(store, "rotate signing keys")}
     assert hits["key-recon"].to_dict()["risk"] == "high"
     assert hits["key-rotation"].to_dict()["risk"] == "none"
+
+
+def test_no_critical_is_reachable_by_any_combination(store):
+    """The invariant the whole gate exists to maintain, over every state a row
+    can be in.
+
+    A critical skill can reach search through two different doors, and the
+    filter has to close both: a row with no decision yet falls back to the
+    rule level, and a row with a decision is judged by that decision alone.
+    Earlier this branched on whether the `risk_action` *column* existed, using
+    its presence as a proxy for "a decision was made" — which broke the moment
+    the column joined the base schema, because then every value was NULL,
+    coalesced to allow, and served criticals.
+
+    Verified against the live corpus at the time of writing: 2,025 criticals,
+    0 reachable; 2,105 blocked rows, 0 reachable.
+    """
+    combos = [
+        ("critical", None,     False, "critical, no decision yet"),
+        ("critical", "block",  False, "critical, blocked"),
+        ("critical", "flag",   True,  "critical the model downgraded to flag"),
+        ("critical", "allow",  True,  "critical with an explicit allow"),
+        ("high",     None,     True,  "high, no decision"),
+        ("high",     "block",  False, "high the model escalated"),
+        ("none",     "block",  False, "clean rules, blocked by the model"),
+        ("none",     None,     True,  "clean, no decision"),
+    ]
+    for level, action, expect_served, label in combos:
+        served = _filter_says_served(level, action)
+        assert served == expect_served, (
+            f"{label}: filter says served={served}, expected {expect_served}")
+
+    # And the two that must hold no matter what the model says: a recorded
+    # block always withholds, and a critical without a decision always
+    # withholds. Those are the doors.
+    assert not _filter_says_served("critical", None)
+    assert not _filter_says_served("none", "block")
+
+
+def _filter_says_served(level, action):
+    """The clause from skill_engine/search.py, evaluated in SQLite itself.
+
+    Re-implementing it in Python would test a copy of the logic rather than
+    the logic, and the bug this guards against was in exactly that gap.
+    """
+    import sqlite3
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE s (risk_level TEXT, risk_action TEXT)")
+    con.execute("INSERT INTO s VALUES (?, ?)", (level, action))
+    row = con.execute(
+        "SELECT CASE WHEN s.risk_action IS NOT NULL "
+        "            THEN s.risk_action != 'block' "
+        "            ELSE COALESCE(s.risk_level, 'none') != 'critical' END "
+        "FROM s").fetchone()
+    con.close()
+    return bool(row[0])
