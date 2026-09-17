@@ -134,3 +134,20 @@ def test_audit_writes_cannot_newly_serve_a_withheld_skill():
             assert not (served_after and not served_before), (
                 f"a {level} verdict with model={analysis is not None} became "
                 f"{action}, which would newly serve a withheld skill")
+
+
+def test_audit_loop_holds_a_lock_and_reseeds():
+    """Two properties the continuous auditor depends on.
+
+    A second auditor would sample the same tier concurrently and spend
+    inference twice — the mistake maintain.sh was making against the verifier.
+    And a fixed seed would redraw the same sample every batch: the audit skips
+    already-decided contents so it would still advance, but in a fixed order,
+    which is not a random sample of anything and cannot support a bound.
+    """
+    script = (ROOT / "ops" / "audit.sh").read_text()
+    assert "logs/audit.pid" in script
+    assert 'kill -0 "$(cat "$LOCK"' in script
+    assert "trap cleanup EXIT" in script
+    # a per-batch seed, not a constant
+    assert "--seed" in script and "SEED=$((" in script
