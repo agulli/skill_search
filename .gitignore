@@ -11,3 +11,8 @@ logs/
 # Rust build output
 rust/target/
 logs/maintain.pid
+
+# Release artefacts: derived from the corpus and regenerable via release.py.
+# Everything here is a .db today, so *.db already covers it — named explicitly
+# so a non-.db artefact cannot be committed by accident.
+dist/

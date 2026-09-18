@@ -1,4 +1,18 @@
-"""Hand-labelled evaluation set, built by reading the evidence in each case."""
+"""Hand-labelled evaluation set, built by reading the evidence in each case.
+
+A note on the repositories named below, since this file is public and they
+belong to real people. Most of the entries under ATTACKS are *deliberate test
+fixtures* living inside legitimate security tools — `skillvet`, `skillhawk`,
+`skilldoctor`, `skillxray`, `skill-scanner` and `skill-audit` are scanners,
+and shipping attack samples beside a scanner is exactly how you test one.
+Naming a fixture here is not an accusation against its repository.
+
+That distinction cost this project real errors in both directions: the tools
+were once labelled as attacks because they sat beside their own fixtures, and
+two fixtures were once labelled benign because they sat inside a tool. In a
+repository that ships a scanner next to its test corpus, the scanner is the
+tool and the fixtures are the attacks.
+"""
 # Genuine attacks or deliberate attack fixtures. Verified by reading the body.
 ATTACKS = {
  "prompt-injection@8ddieHu0314/Skill-Lab",
