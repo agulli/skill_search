@@ -18,6 +18,7 @@ import bisect
 import json
 import logging
 import math
+import sqlite3
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable
@@ -455,19 +456,37 @@ def recompute(store: Any, w: Weights = Weights(), *, keep_detail: bool = True) -
     # a fetchall on this table has already put 17.5GB into swap on this project
     # once. The read below streams, so the only thing worth bounding is the
     # write buffer.
-    BATCH = 20_000
+    # Small batches on purpose. This pass rewrites every row in the corpus
+    # while the crawler and the verifier write to the same file, and a
+    # 20,000-row executemany holds the write lock long enough to outlast even
+    # a 180-second busy timeout -- the first attempt at this backfill died on
+    # `database is locked` after thirteen minutes of work.
+    BATCH = 5_000
     batch: list[tuple] = []
     scored = 0
 
     def flush() -> None:
         if not batch:
             return
-        store.db.executemany(
-            "UPDATE skills SET score = ?, score_detail = ?, dup_count = ? "
-            "WHERE id = ?",
-            batch,
-        )
-        store.commit()
+        # Retry rather than abort. Losing the lock here discards every row
+        # scored since the last flush, and on a four-million-row pass that is
+        # hours of work. The writers this contends with hold their locks for
+        # seconds, so backing off and trying again clears it.
+        for attempt in range(6):
+            try:
+                store.db.executemany(
+                    "UPDATE skills SET score = ?, score_detail = ?, "
+                    "dup_count = ? WHERE id = ?",
+                    batch,
+                )
+                store.commit()
+                break
+            except sqlite3.OperationalError as exc:
+                if "locked" not in str(exc).lower() or attempt == 5:
+                    raise
+                wait = 5 * (attempt + 1)
+                log.warning("corpus locked (%s); retrying in %ds", exc, wait)
+                time.sleep(wait)
         batch.clear()
 
     # Only the columns scoring reads. `SELECT *` carries the body — up to 4KB
