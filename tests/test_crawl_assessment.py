@@ -333,3 +333,54 @@ def test_an_unchanged_verdict_keeps_its_decision(st):
     put(st, "s.md", "Formats your code neatly.")
     after = row(st, "s.md")
     assert after["risk_action"] == "flag" and after["risk_confidence"] == 0.55
+
+
+def test_a_recrawl_does_not_zero_a_computed_score(st):
+    """A crawl must never demote a score that ranking computed.
+
+    The crawler does not score — ranking runs later over the whole corpus,
+    where the statistics it needs exist — so the score on an incoming record
+    is 0. Writing that straight through meant every re-crawl silently zeroed
+    the quality of every skill it touched, while score_detail, absent from the
+    conflict clause, kept the real value. 2,227,995 rows in the live corpus
+    ended up reading score 0 beside a detail saying 82.91, and since the index
+    ranks on the column, the best skills sank out of view.
+    """
+    store = st
+    rec = {
+        "repo": "a/b", "path": "skills/a/SKILL.md", "name": "a",
+        "description": "d", "body": "# a\n\nbody text", "heading": "a",
+        "version": "", "license": "", "allowed_tools": "[]", "metadata": "",
+        "resources": "[]", "source_kind": "tarball", "blob_sha": "s1",
+        "content_hash": "h1", "body_len": 11, "score": 0.0, "valid": 1,
+        "invalid_reason": "", "warnings": "",
+    }
+    store.upsert_skill(rec)
+    # ranking runs and writes a real score
+    store.db.execute("UPDATE skills SET score = 82.91 WHERE content_hash = 'h1'")
+    store.commit()
+
+    # the same skill is crawled again, unchanged, carrying score 0
+    store.upsert_skill(dict(rec, blob_sha="s2"))
+    store.commit()
+    kept = store.db.execute("SELECT score FROM skills WHERE content_hash='h1'"
+                            ).fetchone()[0]
+    assert kept == 82.91, f"a re-crawl zeroed the score to {kept}"
+
+    # and an edit that changes the text keeps it too: the score is merely
+    # stale, not unsafe, and dropping it would hide a good skill until the
+    # next full ranking pass. This is the deliberate difference from the risk
+    # decision, which *is* cleared on a content change.
+    store.upsert_skill(dict(rec, body="# a\n\ndifferent", content_hash="h2",
+                            blob_sha="s3"))
+    store.commit()
+    kept = store.db.execute("SELECT score FROM skills WHERE repo='a/b'"
+                            ).fetchone()[0]
+    assert kept == 82.91
+
+    # a real incoming score still wins
+    store.upsert_skill(dict(rec, content_hash="h2", blob_sha="s4", score=61.0))
+    store.commit()
+    kept = store.db.execute("SELECT score FROM skills WHERE repo='a/b'"
+                            ).fetchone()[0]
+    assert kept == 61.0

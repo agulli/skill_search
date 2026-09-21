@@ -658,7 +658,27 @@ class Store:
                 allowed_tools=excluded.allowed_tools, metadata=excluded.metadata,
                 resources=excluded.resources, source_kind=excluded.source_kind,
                 blob_sha=excluded.blob_sha, content_hash=excluded.content_hash,
-                body_len=excluded.body_len, score=excluded.score, valid=excluded.valid,
+                body_len=excluded.body_len, valid=excluded.valid,
+                -- Never let a crawl demote a computed score.
+                --
+                -- The crawler does not score; `rec["score"]` is 0 here because
+                -- ranking runs later, over the whole corpus, where the
+                -- statistics it needs exist. Writing that 0 straight through
+                -- meant every re-crawl silently zeroed the quality of every
+                -- skill it touched, while `score_detail` -- absent from this
+                -- list -- kept the real value. 2,227,995 rows ended up reading
+                -- score 0 beside a detail saying 82.91, and the index ranks on
+                -- the column, so the best skills sank out of view.
+                --
+                -- Same shape as the risk clearing below: a stored judgement
+                -- and the record it describes drifting apart. The difference
+                -- is the direction that is safe. A risk decision about changed
+                -- text must be dropped, because keeping it could serve an
+                -- attack. A quality score about changed text is merely stale,
+                -- and dropping it hides a good skill -- so it is kept until
+                -- `recompute()` replaces it with a real one.
+                score = CASE WHEN excluded.score > 0
+                    THEN excluded.score ELSE skills.score END,
                 invalid_reason=excluded.invalid_reason, warnings=excluded.warnings,
                 last_seen=excluded.last_seen,
                 -- A changed body is a different document, and the decision
