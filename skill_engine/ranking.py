@@ -448,8 +448,35 @@ def recompute(store: Any, w: Weights = Weights(), *, keep_detail: bool = True) -
         )
     }
 
-    skill_updates = []
-    for s in store.db.execute("SELECT * FROM skills"):
+    # Written in batches rather than accumulated.
+    #
+    # One tuple per skill is cheap; the JSON detail beside it is not. At 4.3M
+    # skills that list is several gigabytes before a single row is written, and
+    # a fetchall on this table has already put 17.5GB into swap on this project
+    # once. The read below streams, so the only thing worth bounding is the
+    # write buffer.
+    BATCH = 20_000
+    batch: list[tuple] = []
+    scored = 0
+
+    def flush() -> None:
+        if not batch:
+            return
+        store.db.executemany(
+            "UPDATE skills SET score = ?, score_detail = ?, dup_count = ? "
+            "WHERE id = ?",
+            batch,
+        )
+        store.commit()
+        batch.clear()
+
+    # Only the columns scoring reads. `SELECT *` carries the body — up to 4KB
+    # a row, 17GB across the corpus — through a loop that never looks at it.
+    for s in store.db.execute(
+        "SELECT id, repo, name, description, content_hash, body_len, "
+        "       allowed_tools, resources, warnings, valid, risk_level "
+        "FROM skills"
+    ):
         repo = repos.get(s["repo"])
         if repo is None:
             continue
@@ -464,14 +491,16 @@ def recompute(store: Any, w: Weights = Weights(), *, keep_detail: bool = True) -
             name_collisions=name_counts.get(s["name"], 1),
             author_score=authors.get(s["repo"].split("/", 1)[0]),
         )
-        skill_updates.append((
+        batch.append((
             score, json.dumps(detail) if keep_detail else None, dups, s["id"]
         ))
-    store.db.executemany(
-        "UPDATE skills SET score = ?, score_detail = ?, dup_count = ? WHERE id = ?",
-        skill_updates,
-    )
-    store.commit()
+        scored += 1
+        if len(batch) >= BATCH:
+            flush()
+            if scored % 200_000 == 0:
+                log.info("  scored %d skills", scored)
+    flush()
+    skill_updates = range(scored)  # only its length is used below
 
     return {
         "repos_scored": len(updates),
