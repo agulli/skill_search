@@ -470,9 +470,15 @@ def recompute(store: Any, w: Weights = Weights(), *, keep_detail: bool = True) -
             return
         # Retry rather than abort. Losing the lock here discards every row
         # scored since the last flush, and on a four-million-row pass that is
-        # hours of work. The writers this contends with hold their locks for
-        # seconds, so backing off and trying again clears it.
-        for attempt in range(6):
+        # hours of work -- the second attempt at this backfill reached the
+        # first flush after two hours of statistics and author profiling, then
+        # threw it away after 75 seconds of backoff.
+        #
+        # Twelve attempts capped at a minute each is about ten minutes of
+        # patience, which covers a busy crawler. It does not make this pass
+        # cheap to run against one: the crawler writes continuously, so the
+        # right move for a full rerank is still to pause it first.
+        for attempt in range(12):
             try:
                 store.db.executemany(
                     "UPDATE skills SET score = ?, score_detail = ?, "
@@ -482,9 +488,9 @@ def recompute(store: Any, w: Weights = Weights(), *, keep_detail: bool = True) -
                 store.commit()
                 break
             except sqlite3.OperationalError as exc:
-                if "locked" not in str(exc).lower() or attempt == 5:
+                if "locked" not in str(exc).lower() or attempt == 11:
                     raise
-                wait = 5 * (attempt + 1)
+                wait = min(60, 5 * (attempt + 1))
                 log.warning("corpus locked (%s); retrying in %ds", exc, wait)
                 time.sleep(wait)
         batch.clear()
