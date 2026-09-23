@@ -769,22 +769,6 @@ class Store:
         ).fetchall()
         return {r["content_hash"]: r["c"] for r in rows}
 
-    def rescore_duplicates(self) -> int:
-        """Demote verbatim copies once we can see the whole corpus."""
-        dupes = self.duplicate_counts()
-        if not dupes:
-            return 0
-        import math
-
-        for chash, count in dupes.items():
-            penalty = min(15.0, 3.0 * math.log2(count + 1))
-            self.db.execute(
-                "UPDATE skills SET score = MAX(0, score - ?) WHERE content_hash = ?",
-                (penalty, chash),
-            )
-        self.db.commit()
-        return len(dupes)
-
     def stats(self) -> dict[str, Any]:
         q = self.db.execute
         return {

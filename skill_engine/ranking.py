@@ -20,7 +20,7 @@ import logging
 import math
 import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, Iterable
 
 from .metadata import days_since
@@ -535,7 +535,3 @@ def recompute(store: Any, w: Weights = Weights(), *, keep_detail: bool = True) -
         "corpus_n": stats.n,
     }
 
-
-def default_weights() -> dict[str, Any]:
-    """Returns default ranking weights as dictionary."""
-    return asdict(Weights())
