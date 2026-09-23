@@ -224,11 +224,11 @@ command can be interrupted and rerun to resume where it stopped.
 
 ## Documentation
 
-- **[Technical Architecture & Design (whitepaper.md)](whitepaper.md)**: In-depth engineering specifications, mathematical formulations, ranking proofs, and retrieval benchmarks.
-- **[Security & Abuse Mitigation (ABUSE.md)](ABUSE.md)**: Edge defense architecture, rate limiting policies, and scraping protections.
-- **[The Blocking Gate (SAFETY.md)](SAFETY.md)**: How a skill is judged harmful, what each signal was measured at, and how to review or reverse a block.
+- **[Technical Architecture & Design (doc/whitepaper.md)](doc/whitepaper.md)**: In-depth engineering specifications, mathematical formulations, ranking proofs, and retrieval benchmarks.
+- **[Security & Abuse Mitigation (doc/ABUSE.md)](doc/ABUSE.md)**: Edge defense architecture, rate limiting policies, and scraping protections.
+- **[The Blocking Gate (doc/SAFETY.md)](doc/SAFETY.md)**: How a skill is judged harmful, what each signal was measured at, and how to review or reverse a block.
 - **[Evaluation (doc/eval.md)](doc/eval.md)**: What the gate actually scores — precision, recall, false positives and false negatives, each with the sample it was measured on and the interval it carries.
-- **[Rust Acceleration (RUST.md)](RUST.md)**: The measured profile, what the native extension buys per component, and what it does not.
+- **[Rust Acceleration (doc/RUST.md)](doc/RUST.md)**: The measured profile, what the native extension buys per component, and what it does not.
 
 ---
 
