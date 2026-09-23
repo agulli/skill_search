@@ -15,6 +15,7 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import os
 import sqlite3
 import subprocess
@@ -45,11 +46,16 @@ def log_step(label: str) -> float:
 
 
 def main() -> int:
-    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
-        print(__doc__.strip())
-        return 0
-    src = Path(sys.argv[1] if len(sys.argv) > 1 else "data/scale.db")
-    dst = Path(sys.argv[2] if len(sys.argv) > 2 else "dist/skills.db")
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("src", nargs="?", default="data/scale.db")
+    ap.add_argument("dst", nargs="?", default="dist/skills.db")
+    ap.add_argument("--limit", type=int, default=0, metavar="N",
+                    help="keep only the N highest-scoring servable skills. "
+                         "For demo and preview builds; 0 ships everything.")
+    args = ap.parse_args()
+    src = Path(args.src)
+    dst = Path(args.dst)
     if not src.exists():
         print(f"Error: Source database does not exist: {src}", file=sys.stderr)
         return 1
@@ -67,6 +73,39 @@ def main() -> int:
     print(f"    Snapshot created ({format_gb(dst):.2f} GB) in {time.time()-t:.0f}s")
 
     store = Store(dst)
+
+    # 1b. Trim to the requested size, before anything expensive runs on rows
+    # that are about to be deleted.
+    #
+    # Trimming here rather than at the end is what makes a demo build cheap:
+    # categorisation, body truncation, the FTS rebuild and the final vacuum
+    # then all operate on N rows instead of four million. It relies on the
+    # score already in the corpus, which is correct as long as `rank` has been
+    # run since the last crawl -- and the build recomputes scores afterwards
+    # anyway, so anything stale only affects *which* skills were kept, not what
+    # they are finally scored at.
+    #
+    # Blocked skills are excluded from the ranking rather than deleted
+    # separately: a withheld skill should never occupy one of the N slots.
+    if args.limit:
+        t = log_step(f"Trimming to the {args.limit:,} highest-scoring skills")
+        before = store.db.execute("SELECT COUNT(*) FROM skills").fetchone()[0]
+        store.db.execute(
+            "DELETE FROM skills WHERE id NOT IN ("
+            "  SELECT id FROM skills"
+            "   WHERE valid = 1 AND COALESCE(risk_action,'') != 'block'"
+            "   ORDER BY score DESC LIMIT ?)", (args.limit,))
+        store.db.commit()
+        kept = store.db.execute("SELECT COUNT(*) FROM skills").fetchone()[0]
+        cut = store.db.execute(
+            "SELECT MIN(score) FROM skills").fetchone()[0] or 0.0
+        print(f"    {before:,} -> {kept:,} skills (score floor {cut:.1f}) "
+              f"in {time.time()-t:.0f}s")
+        # Repositories and authors with nothing left to point at.
+        store.db.execute(
+            "DELETE FROM repos WHERE full_name NOT IN "
+            "(SELECT DISTINCT repo FROM skills)")
+        store.db.commit()
 
     # 2. Temporarily drop triggers to optimize bulk update performance
     t = log_step("Disabling FTS triggers for bulk compute")
@@ -120,12 +159,26 @@ def main() -> int:
                 f"{src} --topup --sample 60\n"
                 f"  Or set SKILL_ENGINE_ALLOW_UNASSESSED=1 to ship anyway.")
     print(f"    Completed in {time.time()-t:.0f}s")
-    t = log_step("Computing corpus-calibrated quality scores")
-    result = recompute(store)
-    print(
-        f"    Scored {result['repos_scored']:,} repos, {result.get('authors_scored', 0):,} "
-        f"authors, {result['skills_scored']:,} skills in {time.time()-t:.0f}s"
-    )
+    # Scores are corpus-relative percentiles, so recomputing them on a trimmed
+    # build would rank the survivors against each other instead of against the
+    # corpus. A skill at the 95th percentile of four million lands near the
+    # median of a hand-picked hundred thousand, and every displayed score would
+    # collapse toward the middle -- the trimmed set is not the population the
+    # score is supposed to describe. The snapshot already carries scores
+    # computed over the whole corpus, which is the right basis, so a trimmed
+    # build keeps them.
+    if args.limit:
+        print("  [skip] Quality scores kept from the full-corpus ranking")
+        print("         (recomputing here would re-rank the survivors against"
+              " each other)")
+    else:
+        t = log_step("Computing corpus-calibrated quality scores")
+        result = recompute(store)
+        print(
+            f"    Scored {result['repos_scored']:,} repos, "
+            f"{result.get('authors_scored', 0):,} "
+            f"authors, {result['skills_scored']:,} skills in {time.time()-t:.0f}s"
+        )
 
     # 4. Classify skills into taxonomy categories
     t = log_step("Categorizing skills via IDF pattern weights")
