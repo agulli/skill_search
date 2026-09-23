@@ -85,12 +85,17 @@ def model_pending(store: Store, args) -> int:
                     "selection will be slower", exc)
 
     rank = {CRITICAL: 0, HIGH: 1, MEDIUM: 2}
+    scope, params = "", ()
+    if getattr(args, "min_score", None) is not None:
+        scope = " AND score >= ?"
+        params = (args.min_score,)
+        log.info("scoped to skills scoring >= %.1f", args.min_score)
     rows = store.db.execute(
         "SELECT id, name, repo, description, body, allowed_tools, path, "
         "       metadata, content_hash, risk_level "
         "FROM skills WHERE valid = 1 "
         "  AND risk_level IN ('critical','high','medium') "
-        "  AND risk_analysis IS NULL").fetchall()
+        f"  AND risk_analysis IS NULL{scope}", params).fetchall()
     if not rows:
         log.info("nothing pending: every flagged skill carries a decision")
         store.close()
@@ -239,17 +244,11 @@ def audit_index(store: Store, args) -> int:
         # A lost write costs a 20-second model call, so retry rather than
         # abort; the measurement survives a contended corpus either way,
         # because the verdict is already counted above.
-        for attempt in range(4):
-            try:
-                write_decision(store, r, v, d, a)
-                break
-            except sqlite3.OperationalError as exc:
-                if attempt == 3:
-                    log.warning("could not record %s@%s (%s); the audit "
-                                "counts it but the corpus will not",
-                                r["name"], r["repo"], exc)
-                else:
-                    time.sleep(2 * (attempt + 1))
+        try:
+            write_decision(store, r, v, d, a)   # retries internally
+        except sqlite3.OperationalError as exc:
+            log.warning("could not record %s@%s (%s); the audit counts it "
+                        "but the corpus will not", r["name"], r["repo"], exc)
         if i % 10 == 0 or i == len(todo):
             per = (time.perf_counter() - t0) / i
             log.info("  %d/%d  %.0fs each  eta %.1f h  [flagged %d]",
@@ -279,6 +278,31 @@ def audit_index(store: Store, args) -> int:
     return 0
 
 
+def _with_retry(fn, what: str, attempts: int = 12):
+    """Run a corpus write, waiting out whoever else holds the lock.
+
+    SQLite permits one writer, and this corpus has several: the crawler, the
+    continuous verifier, the sampler, and whatever pass is running by hand.
+    Three separate passes have now died on `database is locked` -- a four-hour
+    rerank, an audit, and a scoped decision run -- each throwing away work
+    already paid for. The writers involved hold their locks for seconds, so
+    waiting is almost always the right move and aborting almost never is.
+
+    Lives here rather than in each caller because this was fixed three times in
+    three places before it was fixed once.
+    """
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or attempt == attempts - 1:
+                raise
+            wait = min(60, 5 * (attempt + 1))
+            log.warning("corpus locked during %s (%s); retrying in %ds",
+                        what, exc, wait)
+            time.sleep(wait)
+
+
 def write_decision(store: Store, row, verdict, decision, analysis) -> None:
     """Record one decision against every copy of the same content."""
     payload = (verdict.level, decision.confidence, decision.action,
@@ -286,10 +310,11 @@ def write_decision(store: Store, row, verdict, decision, analysis) -> None:
                json.dumps({**decision.as_dict(),
                            "analysis": analysis.as_dict() if analysis else None}))
     if row["content_hash"]:
-        store.db.execute(
+        _with_retry(lambda: store.db.execute(
             "UPDATE skills SET risk_level = ?, risk_confidence = ?, "
             "risk_action = ?, risk_detail = ?, risk_analysis = ? "
-            "WHERE content_hash = ?", (*payload, row["content_hash"]))
+            "WHERE content_hash = ?", (*payload, row["content_hash"])),
+            "write_decision")
     else:
         store.db.execute(
             "UPDATE skills SET risk_level = ?, risk_confidence = ?, "
@@ -462,6 +487,12 @@ def main() -> int:
                     help="also model N randomly chosen *unflagged* skills, to "
                          "estimate what the rule gate misses")
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--min-score", type=float, default=None, metavar="S",
+                    help="with --pending, decide only skills scoring at least "
+                         "S. The backlog is worked severity-first across the "
+                         "whole corpus, which is right for protection and "
+                         "wrong when a release is blocked on a handful of "
+                         "skills inside one tier.")
     ap.add_argument("--pending", action="store_true",
                     help="model only the skills the crawler already flagged, "
                          "read from the stored verdict instead of re-running "
