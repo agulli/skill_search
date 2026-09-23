@@ -74,8 +74,21 @@ def main() -> int:
 
     store = Store(dst)
 
-    # 1b. Trim to the requested size, before anything expensive runs on rows
-    # that are about to be deleted.
+    # 2. Temporarily drop triggers to optimize bulk update performance
+    t = log_step("Disabling FTS triggers for bulk compute")
+    for trg in ("skills_ai", "skills_ad", "skills_au"):
+        store.db.execute(f"DROP TRIGGER IF EXISTS {trg}")
+    store.db.commit()
+    print(f"    Completed in {time.time()-t:.0f}s")
+
+    # 2b. Trim to the requested size.
+    #
+    # After the triggers are dropped, not before. Deleting four million rows
+    # with the FTS triggers live fires a skills_fts delete per row, and that
+    # failed outright with `database disk image is malformed` -- both
+    # databases passed integrity_check, because integrity_check does not cover
+    # FTS5 shadow tables. The index is rebuilt wholesale at step 6 anyway, so
+    # maintaining it through a bulk delete is pure cost even when it works.
     #
     # Trimming here rather than at the end is what makes a demo build cheap:
     # categorisation, body truncation, the FTS rebuild and the final vacuum
@@ -106,13 +119,6 @@ def main() -> int:
             "DELETE FROM repos WHERE full_name NOT IN "
             "(SELECT DISTINCT repo FROM skills)")
         store.db.commit()
-
-    # 2. Temporarily drop triggers to optimize bulk update performance
-    t = log_step("Disabling FTS triggers for bulk compute")
-    for trg in ("skills_ai", "skills_ad", "skills_au"):
-        store.db.execute(f"DROP TRIGGER IF EXISTS {trg}")
-    store.db.commit()
-    print(f"    Completed in {time.time()-t:.0f}s")
 
     # 3. Compute corpus-relative quality rankings
     t = log_step("Inspecting what each skill instructs an agent to do")
